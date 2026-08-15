@@ -1,0 +1,375 @@
+using System;
+using System.Collections.Generic;
+using System.IO.Ports;
+using System.Threading;
+
+namespace DisplayRotate
+{
+    internal enum SensorDirection
+    {
+        Up,
+        Right,
+        Down,
+        Left,
+        Unknown
+    }
+
+    /// <summary>
+    /// GY-25T 串口通信：组帧/校验/加速度解析/方向判定，逻辑与 Qt 版一致。
+    /// </summary>
+    internal class Gy25t : IDisposable
+    {
+        private const int AccWindow = 20;
+        private const int XUp = -1;  // 安装方向约定：X 轴 -1g = 上（装反了交换这两个常量）
+        private const int XDown = 1; // X 轴 +1g = 下
+
+        private readonly SerialPort _port;
+        private readonly List<byte> _rx = new List<byte>();
+        private readonly int[][] _acc = new int[3][];
+        private readonly Dictionary<string, int> _countMap = new Dictionary<string, int>();
+        private readonly ManualResetEventSlim _ackEvent = new ManualResetEventSlim(false);
+        private readonly object _lock = new object();
+
+        private int _accIndex;
+        private int _accCount;
+        private bool _ready;
+        private bool _subscribed;
+        private byte[] _pendingCmd;
+
+        public bool IsOpen
+        {
+            get { return _port != null && _port.IsOpen; }
+        }
+
+        public string PortName
+        {
+            get { return _port.PortName; }
+        }
+
+        public SensorDirection LastDirection { get; private set; }
+
+        public event Action<bool> ReadyChanged;
+        public event Action<SensorDirection> Rotated;
+
+        public Gy25t()
+        {
+            _port = new SerialPort
+            {
+                BaudRate = 9600,
+                DataBits = 8,
+                Parity = Parity.None,
+                StopBits = StopBits.One
+            };
+            for (int i = 0; i < 3; i++)
+                _acc[i] = new int[AccWindow + 2];
+        }
+
+        public void SetPortName(string name)
+        {
+            _port.PortName = name;
+        }
+
+        public bool Open()
+        {
+            try
+            {
+                if (!_port.IsOpen)
+                    _port.Open();
+                if (!_subscribed)
+                {
+                    _port.DataReceived += OnDataReceived;
+                    _port.ErrorReceived += OnErrorReceived;
+                    _subscribed = true;
+                }
+                ResetState();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public void Close()
+        {
+            try
+            {
+                if (_subscribed)
+                {
+                    _port.DataReceived -= OnDataReceived;
+                    _port.ErrorReceived -= OnErrorReceived;
+                    _subscribed = false;
+                }
+                if (_port.IsOpen)
+                    _port.Close();
+            }
+            catch
+            {
+            }
+            ResetState();
+            SetReady(false);
+        }
+
+        /// <summary>初始化序列：查询模式 → 配置 → 自动模式，每条指令等待应答（最多 3 秒）。</summary>
+        public void Init()
+        {
+            WriteSync(Hex("00 06 03 01 0A")); // 查询模式
+            WriteSync(Hex("00 06 07 53 60")); // 水平模式
+            WriteSync(Hex("00 06 02 01 09")); // 50Hz 上报
+            WriteSync(Hex("00 03 08 06 11")); // 读取加速度寄存器
+            WriteSync(Hex("00 06 03 00 09")); // 自动模式（开始持续上报）
+            WriteSync(Hex("00 06 05 55 60")); // 保存设置
+        }
+
+        private void ResetState()
+        {
+            lock (_lock)
+            {
+                _rx.Clear();
+                _pendingCmd = null;
+                _ackEvent.Reset();
+                _accIndex = 0;
+                _accCount = 0;
+                foreach (int[] a in _acc)
+                    Array.Clear(a, 0, a.Length);
+                _countMap.Clear();
+                LastDirection = SensorDirection.Unknown;
+            }
+        }
+
+        private bool WriteSync(byte[] cmd)
+        {
+            lock (_lock)
+            {
+                if (_pendingCmd != null)
+                    return false;
+                _pendingCmd = cmd;
+                _ackEvent.Reset();
+            }
+            try
+            {
+                _port.Write(cmd, 0, cmd.Length);
+                return _ackEvent.Wait(3000);
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                lock (_lock)
+                    _pendingCmd = null;
+            }
+        }
+
+        private static byte[] Hex(string s)
+        {
+            s = s.Replace(" ", "");
+            byte[] b = new byte[s.Length / 2];
+            for (int i = 0; i < b.Length; i++)
+                b[i] = Convert.ToByte(s.Substring(i * 2, 2), 16);
+            return b;
+        }
+
+        private void OnDataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                int n = _port.BytesToRead;
+                if (n <= 0)
+                    return;
+                byte[] buf = new byte[n];
+                int read = _port.Read(buf, 0, n);
+                if (read <= 0)
+                    return;
+                lock (_lock)
+                {
+                    for (int i = 0; i < read; i++)
+                        _rx.Add(buf[i]);
+                    ProcessBuffer();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void OnErrorReceived(object sender, SerialErrorReceivedEventArgs e)
+        {
+            SetReady(false);
+        }
+
+        private void ProcessBuffer()
+        {
+            while (_rx.Count >= 5)
+            {
+                int idx = _rx.IndexOf(0xA4);
+                if (idx < 0)
+                {
+                    _rx.Clear();
+                    return;
+                }
+                if (idx > 0)
+                    _rx.RemoveRange(0, idx);
+
+                byte func = _rx[1];
+                int total;
+                if (func == 0x03)
+                    total = 5 + _rx[3];
+                else if (func == 0x06 || func == 0x86 || func == 0x83)
+                    total = 5;
+                else
+                {
+                    _rx.RemoveAt(0);
+                    continue;
+                }
+
+                if (_rx.Count < total)
+                    return;
+
+                byte[] frame = _rx.GetRange(0, total).ToArray();
+                _rx.RemoveRange(0, total);
+                HandleFrame(frame);
+            }
+        }
+
+        private void HandleFrame(byte[] frame)
+        {
+            if (!Checksum(frame))
+                return;
+            if (frame[0] != 0xA4)
+                return;
+
+            if (HandleWriteFeedback(frame))
+                return;
+
+            // 加速度帧：A4 03 08 06 + X/Y/Z 各 2 字节 + 校验和
+            if (frame.Length == 11 && frame[1] == 0x03 && frame[2] == 0x08 && frame[3] == 0x06)
+                HandleAcc(frame);
+        }
+
+        private static bool Checksum(byte[] b)
+        {
+            if (b.Length < 2)
+                return false;
+            byte sum = 0;
+            for (int i = 0; i < b.Length - 1; i++)
+                sum += b[i];
+            return sum == b[b.Length - 1];
+        }
+
+        private bool HandleWriteFeedback(byte[] frame)
+        {
+            byte[] pending;
+            lock (_lock)
+                pending = _pendingCmd;
+            if (pending == null)
+                return false;
+
+            if (frame[1] == 0x03 || frame[1] == 0x06)
+            {
+                if (frame[1] == pending[1] && frame[2] == pending[2] && frame[3] == pending[3])
+                {
+                    _ackEvent.Set();
+                    return true;
+                }
+            }
+            else if (frame[1] == 0x86 || frame[1] == 0x83)
+            {
+                _ackEvent.Set();
+                return true;
+            }
+            return false;
+        }
+
+        private void HandleAcc(byte[] frame)
+        {
+            SetReady(true);
+
+            int ix = (short)((frame[4] << 8) | frame[5]);
+            int iy = (short)((frame[6] << 8) | frame[7]);
+            int iz = (short)((frame[8] << 8) | frame[9]);
+            ix /= 100;
+            iy /= 100;
+            iz /= 100;
+
+            if (_accCount < AccWindow)
+                _accCount++;
+            _accIndex = (_accIndex + 1) % AccWindow;
+            _acc[0][_accIndex] = ix;
+            _acc[1][_accIndex] = iy;
+            _acc[2][_accIndex] = iz;
+
+            int qx = 0, qy = 0, qz = 0;
+            if (_accCount > 0)
+            {
+                long sx = 0, sy = 0, sz = 0;
+                for (int i = 0; i < _accCount; i++)
+                {
+                    sx += _acc[0][i];
+                    sy += _acc[1][i];
+                    sz += _acc[2][i];
+                }
+                qx = (int)Math.Round((sx / (double)_accCount) / 160.0);
+                qy = (int)Math.Round((sy / (double)_accCount) / 160.0);
+                qz = (int)Math.Round((sz / (double)_accCount) / 160.0);
+            }
+
+            string key = qx + "-" + qy + "-" + qz;
+            int count;
+            if (!_countMap.TryGetValue(key, out count))
+            {
+                _countMap.Clear();
+                _countMap[key] = 1;
+            }
+            else
+            {
+                if (count == 20)
+                {
+                    SensorDirection dir = GetDirection(qx, qy);
+                    LastDirection = dir;
+                    if (dir != SensorDirection.Unknown)
+                    {
+                        Action<SensorDirection> h = Rotated;
+                        if (h != null)
+                            h(dir);
+                    }
+                }
+                if (count < 100)
+                    _countMap[key] = count + 1;
+            }
+        }
+
+        private static SensorDirection GetDirection(int x, int y)
+        {
+            if (y == 1)
+                return SensorDirection.Right;
+            if (y == -1)
+                return SensorDirection.Left;
+            if (x == XUp)
+                return SensorDirection.Up;
+            if (x == XDown)
+                return SensorDirection.Down;
+            return SensorDirection.Unknown;
+        }
+
+        private void SetReady(bool value)
+        {
+            bool changed = _ready != value;
+            _ready = value;
+            if (changed)
+            {
+                Action<bool> h = ReadyChanged;
+                if (h != null)
+                    h(value);
+            }
+        }
+
+        public void Dispose()
+        {
+            Close();
+            _ackEvent.Dispose();
+            _port.Dispose();
+        }
+    }
+}
