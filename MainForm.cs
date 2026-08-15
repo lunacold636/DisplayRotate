@@ -45,12 +45,21 @@ namespace DisplayRotate
         private const string RunValueName = "DisplayRotate";
         private const int HTCAPTION = 2;
         private const int WM_NCLBUTTONDOWN = 0xA1;
+        private const int ReconnectBaseMs = 2000; // 自动重连起始间隔
+        private const int ReconnectMaxMs = 60000; // 自动重连最大间隔（退避封顶）
 
         private readonly Gy25t _sensor = new Gy25t();
         private readonly Dictionary<SensorDirection, DisplayRotation> _rotateMap =
             new Dictionary<SensorDirection, DisplayRotation>();
         private readonly object _rotateLock = new object();
         private readonly System.Windows.Forms.Timer _openTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _reconnectTimer = new System.Windows.Forms.Timer();
+        private bool _reconnectEnabled;
+        private int _reconnectAttempts;
+        private bool _reconnecting;
+        private bool _autoAttempting;
+        private volatile bool _manualClosePending;
+        private bool _startupInitDone;
         private readonly double _scale;
         private readonly Image _imgGreen;
         private readonly Image _imgRed;
@@ -112,6 +121,7 @@ namespace DisplayRotate
 
             _openTimer.Interval = 10000;
             _openTimer.Tick += OnOpenTimeout;
+            _reconnectTimer.Tick += OnReconnectTick;
 
             BuildTray();
             BuildUi();
@@ -119,6 +129,15 @@ namespace DisplayRotate
             _sensor.ReadyChanged += OnReadyChanged;
             _sensor.Rotated += OnSensorRotated;
             Load += OnLoad;
+
+            if (autostart)
+            {
+                // 自启时不显示窗体：主动创建句柄，保证后台线程 BeginInvoke 可用；
+                // 并绕过 Load 事件（首次显示被 SetVisibleCore 抑制时不会触发），直接进入静默自动连接。
+                IntPtr handle = Handle;
+                _startupInitDone = true;
+                InitStartup(true);
+            }
         }
 
         private static Image LoadImage(string name)
@@ -381,6 +400,16 @@ namespace DisplayRotate
 
         private void OnLoad(object sender, EventArgs e)
         {
+            // 自启模式下 InitStartup 已在构造函数执行（首次显示被抑制时 Load 不触发）
+            if (_startupInitDone)
+                return;
+            _startupInitDone = true;
+            InitStartup(_autostart);
+        }
+
+        /// <summary>启动初始化：扫描端口/显示器，并按模式进入自动连接流程。</summary>
+        private void InitStartup(bool autostart)
+        {
             RefreshPorts();
             RefreshMonitors();
             _chkAutoStart.Checked = GetAutoStart();
@@ -388,6 +417,14 @@ namespace DisplayRotate
             string savedPort = SettingsStore.Port;
             if (!string.IsNullOrEmpty(savedPort))
                 SelectPort(savedPort);
+
+            if (autostart)
+            {
+                // 静默自启：不弹窗，直接进入退避重连，设备就绪后自动连接
+                SetStatus(false);
+                StartReconnect();
+                return;
+            }
 
             if (!string.IsNullOrEmpty(savedPort) && PortExists(savedPort))
             {
@@ -404,11 +441,15 @@ namespace DisplayRotate
                         {
                             _openTimer.Stop();
                             SetStatus(false);
+                            StartReconnect();
                         }
                     });
                 });
             }
-
+            else
+            {
+                StartReconnect();
+            }
         }
 
         private static bool GetAutoStart()
@@ -436,7 +477,12 @@ namespace DisplayRotate
         {
             if (_sensor.IsOpen)
             {
+                StopReconnect();
+                _autoAttempting = false;
+                _openTimer.Stop();
+                _manualClosePending = true;
                 _sensor.Close();
+                _manualClosePending = false;
                 SetStatus(false);
                 return;
             }
@@ -449,6 +495,10 @@ namespace DisplayRotate
                 return;
             }
 
+            StopReconnect();
+            _manualClosePending = false;
+            _autoAttempting = false;
+            _openTimer.Stop();
             _btnOpen.Enabled = false;
             _btnOpen.Text = "连接中...";
             _openTimer.Start();
@@ -465,6 +515,9 @@ namespace DisplayRotate
                         SetStatus(false);
                         MessageBox.Show(this, "打开串口失败：" + port, "DisplayRotate",
                             MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        // 失败后转为静默退避重连，设备就绪后自动恢复
+                        if (!_reconnectEnabled)
+                            StartReconnect();
                     }
                 });
             });
@@ -482,22 +535,174 @@ namespace DisplayRotate
         private void OnOpenTimeout(object sender, EventArgs e)
         {
             _openTimer.Stop();
+            if (_autoAttempting)
+            {
+                // 自动重连尝试超时：静默关闭并安排下一次（不弹窗）
+                _autoAttempting = false;
+                _sensor.Close();
+                _reconnecting = false;
+                ScheduleNextReconnect();
+                return;
+            }
             _sensor.Close();
             SetStatus(false);
             MessageBox.Show(this, "打开设备失败：传感器无响应！", "DisplayRotate",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
+        /// <summary>开启自动重连（指数退避，连上后自动停止）。必须在 UI 线程调用。</summary>
+        private void StartReconnect()
+        {
+            _reconnectEnabled = true;
+            _reconnectAttempts = 0;
+            _reconnectTimer.Interval = ReconnectBaseMs;
+            _reconnectTimer.Start();
+        }
+
+        /// <summary>停止自动重连。必须在 UI 线程调用。</summary>
+        private void StopReconnect()
+        {
+            _reconnectEnabled = false;
+            _reconnectTimer.Stop();
+        }
+
+        private void OnReconnectTick(object sender, EventArgs e)
+        {
+            if (!_reconnectEnabled || _reconnecting)
+                return;
+            // 传感器仍在正常上报：不重连
+            if (_sensor.IsOpen && _sensor.IsReady)
+                return;
+
+            string port = FindSensorPort();
+            if (string.IsNullOrEmpty(port))
+            {
+                ScheduleNextReconnect();
+                return;
+            }
+
+            _reconnecting = true;
+            _autoAttempting = true;
+            _openTimer.Start();
+            Task.Run(delegate
+            {
+                bool ok = false;
+                try
+                {
+                    if (!_manualClosePending)
+                    {
+                        // 先清理可能残留的旧串口句柄（静默拔线时端口对象可能处于坏状态）
+                        _sensor.Close();
+                        ok = ConnectTo(port);
+                    }
+                }
+                catch
+                {
+                    ok = false;
+                }
+                try
+                {
+                    BeginInvoke((Action)delegate
+                    {
+                        _reconnecting = false;
+                        bool wasAuto = _autoAttempting;
+                        _autoAttempting = false;
+                        if (wasAuto)
+                            _openTimer.Stop();
+                        if (!ok && _reconnectEnabled)
+                            ScheduleNextReconnect();
+                    });
+                }
+                catch
+                {
+                    _reconnecting = false;
+                }
+            });
+        }
+
+        private void ScheduleNextReconnect()
+        {
+            if (!_reconnectEnabled)
+                return;
+            _reconnectAttempts++;
+            int ms = ReconnectBaseMs;
+            for (int i = 1; i < _reconnectAttempts; i++)
+            {
+                if (ms >= ReconnectMaxMs)
+                    break;
+                ms = Math.Min(ms * 2, ReconnectMaxMs);
+            }
+            _reconnectTimer.Interval = ms;
+            _reconnectTimer.Start();
+        }
+
+        /// <summary>按 保存的端口 → 保存的设备描述 → 唯一端口 的顺序定位传感器串口。</summary>
+        private string FindSensorPort()
+        {
+            RefreshPorts();
+
+            string saved = SettingsStore.Port;
+            if (!string.IsNullOrEmpty(saved) && PortExists(saved))
+                return saved;
+
+            string desc = SettingsStore.Description;
+            if (!string.IsNullOrEmpty(desc))
+            {
+                for (int i = 0; i < _cmbPort.Items.Count; i++)
+                {
+                    ComboItem item = _cmbPort.Items[i] as ComboItem;
+                    if (item != null && item.Display.IndexOf(desc, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return item.Port;
+                }
+            }
+
+            if (_cmbPort.Items.Count == 1)
+            {
+                ComboItem only = _cmbPort.Items[0] as ComboItem;
+                if (only != null)
+                    return only.Port;
+            }
+            return null;
+        }
+
+        /// <summary>取串口对应的设备描述（去掉端口号部分），用于 COM 号变化后重新识别设备。</summary>
+        private string GetPortDescription(string port)
+        {
+            for (int i = 0; i < _cmbPort.Items.Count; i++)
+            {
+                ComboItem item = _cmbPort.Items[i] as ComboItem;
+                if (item != null && item.Port == port)
+                {
+                    string d = item.Display;
+                    if (d.Length > port.Length)
+                        return d.Substring(port.Length).Trim();
+                    return d;
+                }
+            }
+            return "";
+        }
+
         private void OnReadyChanged(bool ready)
         {
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)delegate { OnReadyChanged(ready); });
+                return;
+            }
+
             if (ready)
             {
                 _openTimer.Stop();
+                StopReconnect();
+                _reconnectAttempts = 0;
                 SettingsStore.Port = _sensor.PortName;
+                SettingsStore.Description = GetPortDescription(_sensor.PortName);
             }
             else
             {
                 _firstRotation = true;
+                if (!_manualClosePending && !_reconnecting)
+                    StartReconnect();
             }
             SetStatus(ready);
         }

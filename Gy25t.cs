@@ -22,6 +22,8 @@ namespace DisplayRotate
         private const int AccWindow = 20;
         private const int XUp = -1;  // 安装方向约定：X 轴 -1g = 上（装反了交换这两个常量）
         private const int XDown = 1; // X 轴 +1g = 下
+        private const int WatchdogPeriodMs = 1000;   // 看门狗检查周期
+        private const double WatchdogTimeoutSec = 5; // 超过 5 秒无有效加速度帧即判定离线
 
         private readonly SerialPort _port;
         private readonly List<byte> _rx = new List<byte>();
@@ -32,13 +34,20 @@ namespace DisplayRotate
 
         private int _accIndex;
         private int _accCount;
-        private bool _ready;
+        private volatile bool _ready;
         private bool _subscribed;
         private byte[] _pendingCmd;
+        private DateTime _lastAccUtc = DateTime.MinValue;
+        private System.Threading.Timer _watchdog;
 
         public bool IsOpen
         {
             get { return _port != null && _port.IsOpen; }
+        }
+
+        public bool IsReady
+        {
+            get { return _ready; }
         }
 
         public string PortName
@@ -82,6 +91,12 @@ namespace DisplayRotate
                     _subscribed = true;
                 }
                 ResetState();
+                lock (_lock)
+                {
+                    if (_watchdog == null)
+                        _watchdog = new System.Threading.Timer(OnWatchdogTick, null,
+                            WatchdogPeriodMs, WatchdogPeriodMs);
+                }
                 return true;
             }
             catch
@@ -106,6 +121,10 @@ namespace DisplayRotate
             catch
             {
             }
+            System.Threading.Timer w = _watchdog;
+            _watchdog = null;
+            if (w != null)
+                w.Dispose();
             ResetState();
             SetReady(false);
         }
@@ -133,6 +152,7 @@ namespace DisplayRotate
                 foreach (int[] a in _acc)
                     Array.Clear(a, 0, a.Length);
                 _countMap.Clear();
+                _lastAccUtc = DateTime.MinValue;
                 LastDirection = SensorDirection.Unknown;
             }
         }
@@ -191,12 +211,24 @@ namespace DisplayRotate
             }
             catch
             {
+                SetReady(false);
             }
         }
 
         private void OnErrorReceived(object sender, SerialErrorReceivedEventArgs e)
         {
             SetReady(false);
+        }
+
+        private void OnWatchdogTick(object state)
+        {
+            bool lost;
+            lock (_lock)
+            {
+                lost = _ready && (DateTime.UtcNow - _lastAccUtc).TotalSeconds >= WatchdogTimeoutSec;
+            }
+            if (lost)
+                SetReady(false);
         }
 
         private void ProcessBuffer()
@@ -284,6 +316,7 @@ namespace DisplayRotate
 
         private void HandleAcc(byte[] frame)
         {
+            _lastAccUtc = DateTime.UtcNow;
             SetReady(true);
 
             int ix = (short)((frame[4] << 8) | frame[5]);

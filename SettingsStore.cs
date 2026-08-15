@@ -16,6 +16,13 @@ namespace DisplayRotate
             set { Set("port", value); }
         }
 
+        /// <summary>设备描述（如 USB-SERIAL CH340），用于 COM 号变化后重新识别传感器。</summary>
+        public static string Description
+        {
+            get { return Get("description", ""); }
+            set { Set("description", value); }
+        }
+
         public static string Monitor
         {
             get { return Get("monitor", ""); }
