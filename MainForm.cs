@@ -740,6 +740,7 @@ namespace DisplayRotate
 
         private void OnReadyChanged(bool ready)
         {
+            if (_quitting) return; // 退出中：忽略已入队的回调
             if (InvokeRequired)
             {
                 BeginInvoke((Action)delegate { OnReadyChanged(ready); });
@@ -767,6 +768,7 @@ namespace DisplayRotate
 
         private void OnSensorRotated(SensorDirection dir)
         {
+            if (_quitting) return; // 退出中：不再旋转屏幕
             // 旋转涉及阻塞的 Win32 调用，统一切到 UI 线程执行，避免占住串口接收线程
             if (InvokeRequired)
             {
@@ -865,6 +867,7 @@ namespace DisplayRotate
 
         private void SetStatus(bool connected)
         {
+            if (_quitting) return; // 退出中：忽略已入队的回调
             if (InvokeRequired)
             {
                 BeginInvoke((Action)delegate { SetStatus(connected); });
@@ -1046,6 +1049,9 @@ namespace DisplayRotate
             {
                 _openTimer.Stop();
                 _reconnectTimer.Stop();
+                // 先摘掉事件订阅：Dispose 串口会同步触发 ReadyChanged(false)/Rotated，避免回调访问已置空的 _tray
+                _sensor.ReadyChanged -= OnReadyChanged;
+                _sensor.Rotated -= OnSensorRotated;
                 if (_tray != null)
                 {
                     _tray.Visible = false;
