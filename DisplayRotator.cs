@@ -22,6 +22,7 @@ namespace DisplayRotate
         private const int DMDO_180 = 2;
         private const int DMDO_270 = 3;
         private const int ENUM_CURRENT_SETTINGS = -1;
+        private const int DM_POSITION = 0x00000010;
         private const int DM_PELSWIDTH = 0x00080000;
         private const int DM_PELSHEIGHT = 0x00100000;
         private const int DM_DISPLAYORIENTATION = 0x00000080;
@@ -171,7 +172,7 @@ namespace DisplayRotate
                 if (oldOri == dm.dmDisplayOrientation)
                     return true;
 
-                dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION;
+                dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION | DM_POSITION;
                 int ret = ChangeDisplaySettingsEx(monitor, ref dm, IntPtr.Zero, CDS_RESET, IntPtr.Zero);
                 return ret == DISP_CHANGE_SUCCESSFUL;
             }

@@ -47,11 +47,13 @@ namespace DisplayRotate
         private const int WM_NCLBUTTONDOWN = 0xA1;
         private const int ReconnectBaseMs = 2000; // 自动重连起始间隔
         private const int ReconnectMaxMs = 60000; // 自动重连最大间隔（退避封顶）
+        private const int RotateCooldownMs = 2000; // 旋转后抑制窗口：防止过渡期抖动触发反向旋转/振荡
 
         private readonly Gy25t _sensor = new Gy25t();
         private readonly Dictionary<SensorDirection, DisplayRotation> _rotateMap =
             new Dictionary<SensorDirection, DisplayRotation>();
         private readonly object _rotateLock = new object();
+        private readonly object _sensorOpLock = new object(); // 串口 Open/Close/Init 互斥，避免手动关闭与自动重连竞态
         private readonly System.Windows.Forms.Timer _openTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _reconnectTimer = new System.Windows.Forms.Timer();
         private bool _reconnectEnabled;
@@ -67,6 +69,7 @@ namespace DisplayRotate
         private readonly Image _imgRed32;
 
         private bool _firstRotation = true;
+        private DateTime _lastRotateUtc = DateTime.MinValue; // 最近一次屏幕旋转时间（UTC）
         private bool _autostart;
         private bool _suppressFirstShow;
         private bool _quitting;
@@ -99,7 +102,16 @@ namespace DisplayRotate
             _autostart = autostart;
             _suppressFirstShow = autostart;
 
-            uint dpi = GetDpiForSystem();
+            uint dpi = 0;
+            try
+            {
+                dpi = GetDpiForSystem();
+            }
+            catch
+            {
+                // 旧系统不支持该 API 时按 96 DPI 处理
+                dpi = 0;
+            }
             _scale = (dpi == 0 ? 96.0 : dpi) / 96.0;
 
             _imgGreen = LoadImage("DisplayRotate.logoGreen.png");
@@ -119,7 +131,7 @@ namespace DisplayRotate
             MaximizeBox = false;
             MinimizeBox = false;
 
-            _openTimer.Interval = 10000;
+            _openTimer.Interval = 20000; // 覆盖 Init 最长耗时（6 条指令 × 3 秒 = 18 秒）
             _openTimer.Tick += OnOpenTimeout;
             _reconnectTimer.Tick += OnReconnectTick;
 
@@ -355,12 +367,16 @@ namespace DisplayRotate
                 Activate();
             });
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("重新校准", null, delegate
+            {
+                _firstRotation = true;
+                UpdateDirectionLabel(SensorDirection.Unknown);
+            });
             menu.Items.Add("退出", null, delegate
             {
                 _quitting = true;
                 _tray.Visible = false;
-                _sensor.Dispose();
-                Application.Exit();
+                Application.Exit(); // 资源释放统一在 OnFormClosing 完成
             });
 
             _tray = new NotifyIcon
@@ -393,8 +409,9 @@ namespace DisplayRotate
                     old.Dispose();
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error("更新托盘图标失败", ex);
             }
         }
 
@@ -433,7 +450,11 @@ namespace DisplayRotate
                 _openTimer.Start();
                 Task.Run(delegate
                 {
-                    bool ok = ConnectTo(savedPort);
+                    bool ok = false;
+                    lock (_sensorOpLock)
+                    {
+                        ok = ConnectTo(savedPort);
+                    }
                     BeginInvoke((Action)delegate
                     {
                         _btnOpen.Enabled = true;
@@ -467,9 +488,17 @@ namespace DisplayRotate
                 if (key == null)
                     return;
                 if (enabled)
-                    key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\" --autostart");
+                {
+                    string target = "\"" + Application.ExecutablePath + "\" --autostart";
+                    object existing = key.GetValue(RunValueName);
+                    string existingStr = existing as string;
+                    if (existingStr == null || !string.Equals(existingStr, target, StringComparison.OrdinalIgnoreCase))
+                        key.SetValue(RunValueName, target);
+                }
                 else
+                {
                     key.DeleteValue(RunValueName, false);
+                }
             }
         }
 
@@ -481,7 +510,11 @@ namespace DisplayRotate
                 _autoAttempting = false;
                 _openTimer.Stop();
                 _manualClosePending = true;
-                _sensor.Close();
+                lock (_sensorOpLock)
+                {
+                    try { _sensor.Close(); }
+                    catch (Exception ex) { Log.Error("手动关闭串口", ex); }
+                }
                 _manualClosePending = false;
                 SetStatus(false);
                 return;
@@ -505,7 +538,12 @@ namespace DisplayRotate
 
             Task.Run(delegate
             {
-                bool ok = ConnectTo(port);
+                bool ok = false;
+                lock (_sensorOpLock)
+                {
+                    if (!_manualClosePending)
+                        ok = ConnectTo(port);
+                }
                 BeginInvoke((Action)delegate
                 {
                     _btnOpen.Enabled = true;
@@ -539,12 +577,20 @@ namespace DisplayRotate
             {
                 // 自动重连尝试超时：静默关闭并安排下一次（不弹窗）
                 _autoAttempting = false;
-                _sensor.Close();
+                lock (_sensorOpLock)
+                {
+                    try { _sensor.Close(); }
+                    catch (Exception ex) { Log.Error("自动重连超时关闭串口", ex); }
+                }
                 _reconnecting = false;
                 ScheduleNextReconnect();
                 return;
             }
-            _sensor.Close();
+            lock (_sensorOpLock)
+            {
+                try { _sensor.Close(); }
+                catch (Exception ex) { Log.Error("手动连接超时关闭串口", ex); }
+            }
             SetStatus(false);
             MessageBox.Show(this, "打开设备失败：传感器无响应！", "DisplayRotate",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -589,16 +635,25 @@ namespace DisplayRotate
                 bool ok = false;
                 try
                 {
-                    if (!_manualClosePending)
+                    lock (_sensorOpLock)
                     {
-                        // 先清理可能残留的旧串口句柄（静默拔线时端口对象可能处于坏状态）
-                        _sensor.Close();
-                        ok = ConnectTo(port);
+                        // 用户在重连过程中手动关闭：放弃本次尝试
+                        if (_manualClosePending)
+                        {
+                            ok = false;
+                        }
+                        else
+                        {
+                            // 先清理可能残留的旧串口句柄（静默拔线时端口对象可能处于坏状态）
+                            _sensor.Close();
+                            ok = ConnectTo(port);
+                        }
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
                     ok = false;
+                    Log.Error("自动重连异常", ex);
                 }
                 try
                 {
@@ -613,9 +668,10 @@ namespace DisplayRotate
                             ScheduleNextReconnect();
                     });
                 }
-                catch
+                catch (Exception ex)
                 {
                     _reconnecting = false;
+                    Log.Error("重连结果回调失败", ex);
                 }
             });
         }
@@ -695,6 +751,8 @@ namespace DisplayRotate
                 _openTimer.Stop();
                 StopReconnect();
                 _reconnectAttempts = 0;
+                // 每次（重新）连接后都重新校准，避免手动改过屏幕方向后映射过期
+                _firstRotation = true;
                 SettingsStore.Port = _sensor.PortName;
                 SettingsStore.Description = GetPortDescription(_sensor.PortName);
             }
@@ -709,6 +767,13 @@ namespace DisplayRotate
 
         private void OnSensorRotated(SensorDirection dir)
         {
+            // 旋转涉及阻塞的 Win32 调用，统一切到 UI 线程执行，避免占住串口接收线程
+            if (InvokeRequired)
+            {
+                BeginInvoke((Action)delegate { OnSensorRotated(dir); });
+                return;
+            }
+
             string monitor = _selectedMonitor;
             if (string.IsNullOrEmpty(monitor))
             {
@@ -716,17 +781,29 @@ namespace DisplayRotate
                 return;
             }
 
-            if (_firstRotation)
+            try
             {
-                lock (_rotateLock)
+                if (_firstRotation)
                 {
-                    DisplayRotation r2 = DisplayRotator.GetRotation(monitor);
-                    RebuildMap(dir, r2);
-                    _firstRotation = false;
+                    // 首次校准：以当前屏幕方向建立「传感器方向 → 屏幕旋转」映射
+                    lock (_rotateLock)
+                    {
+                        DisplayRotation r2 = DisplayRotator.GetRotation(monitor);
+                        RebuildMap(dir, r2);
+                        _firstRotation = false;
+                    }
+                    UpdateDirectionLabel(dir);
+                    return;
                 }
-            }
-            else
-            {
+
+                // 旋转后抑制窗口：屏幕切换模式时的过渡读数可能触发反向旋转，短暂忽略
+                DateTime now = DateTime.UtcNow;
+                if ((now - _lastRotateUtc).TotalMilliseconds < RotateCooldownMs)
+                {
+                    UpdateDirectionLabel(dir);
+                    return;
+                }
+
                 DisplayRotation rr;
                 lock (_rotateLock)
                 {
@@ -736,9 +813,14 @@ namespace DisplayRotate
                         return;
                     }
                 }
+                _lastRotateUtc = now;
                 DisplayRotator.Rotate(monitor, rr);
+                UpdateDirectionLabel(dir);
             }
-            UpdateDirectionLabel(dir);
+            catch (Exception ex)
+            {
+                Log.Error("屏幕旋转异常", ex);
+            }
         }
 
         private void RebuildMap(SensorDirection r1, DisplayRotation r2)
@@ -905,18 +987,21 @@ namespace DisplayRotate
                     {
                         foreach (System.Management.ManagementObject o in items)
                         {
-                            string name = o["Name"] as string;
-                            if (string.IsNullOrEmpty(name))
-                                continue;
-                            int i = name.LastIndexOf("(COM");
-                            if (i < 0)
-                                continue;
-                            int j = name.IndexOf(')', i + 4);
-                            if (j <= i)
-                                continue;
-                            string port = name.Substring(i + 1, j - i - 1);
-                            string display = port + "  " + name.Substring(0, i).TrimEnd(' ');
-                            list.Add(new SerialPortInfo(port, display));
+                            using (o)
+                            {
+                                string name = o["Name"] as string;
+                                if (string.IsNullOrEmpty(name))
+                                    continue;
+                                int i = name.LastIndexOf("(COM");
+                                if (i < 0)
+                                    continue;
+                                int j = name.IndexOf(')', i + 4);
+                                if (j <= i)
+                                    continue;
+                                string port = name.Substring(i + 1, j - i - 1);
+                                string display = port + "  " + name.Substring(0, i).TrimEnd(' ');
+                                list.Add(new SerialPortInfo(port, display));
+                            }
                         }
                     }
                 }
@@ -938,14 +1023,65 @@ namespace DisplayRotate
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            // 系统关机/注销/任务管理器结束/Application.Exit 时放行，避免阻止关机；
+            // 其余（点 ×、Alt+F4 等）一律最小化到托盘
             if (!_quitting)
             {
-                e.Cancel = true;
-                Hide();
-                base.OnFormClosing(e);
-                return;
+                if (e.CloseReason == CloseReason.WindowsShutDown ||
+                    e.CloseReason == CloseReason.TaskManagerClosing ||
+                    e.CloseReason == CloseReason.ApplicationExitCall)
+                {
+                    _quitting = true;
+                }
+                else
+                {
+                    e.Cancel = true;
+                    Hide();
+                    base.OnFormClosing(e);
+                    return;
+                }
             }
+
+            if (_quitting)
+            {
+                _openTimer.Stop();
+                _reconnectTimer.Stop();
+                if (_tray != null)
+                {
+                    _tray.Visible = false;
+                    _tray.Dispose();
+                    _tray = null;
+                }
+                lock (_sensorOpLock)
+                {
+                    try { _sensor.Dispose(); }
+                    catch (Exception ex) { Log.Error("退出时释放串口", ex); }
+                }
+                DisposeImages();
+            }
+
             base.OnFormClosing(e);
+        }
+
+        private void DisposeImages()
+        {
+            try
+            {
+                if (_imgGreen32 != null) { _imgGreen32.Dispose(); }
+                if (_imgRed32 != null) { _imgRed32.Dispose(); }
+                if (_imgGreen != null) { _imgGreen.Dispose(); }
+                if (_imgRed != null) { _imgRed.Dispose(); }
+                if (Icon != null)
+                {
+                    Icon old = Icon;
+                    Icon = null;
+                    old.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("释放图片资源失败", ex);
+            }
         }
 
         // 开机自启（--autostart）时拦截首次显示，只保留托盘图标，实现无感启动

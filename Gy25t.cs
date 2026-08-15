@@ -28,7 +28,7 @@ namespace DisplayRotate
         private readonly SerialPort _port;
         private readonly List<byte> _rx = new List<byte>();
         private readonly int[][] _acc = new int[3][];
-        private readonly Dictionary<string, int> _countMap = new Dictionary<string, int>();
+        private readonly Dictionary<SensorDirection, int> _countMap = new Dictionary<SensorDirection, int>();
         private readonly ManualResetEventSlim _ackEvent = new ManualResetEventSlim(false);
         private readonly object _lock = new object();
 
@@ -39,6 +39,8 @@ namespace DisplayRotate
         private byte[] _pendingCmd;
         private DateTime _lastAccUtc = DateTime.MinValue;
         private System.Threading.Timer _watchdog;
+        private volatile int _stateGen; // 连接状态代数：Open/Close 时递增，用于丢弃滞留事件
+        private int _pendingGen;        // 当前待触发事件对应的代数（仅在串口接收线程访问）
 
         public bool IsOpen
         {
@@ -67,7 +69,9 @@ namespace DisplayRotate
                 BaudRate = 9600,
                 DataBits = 8,
                 Parity = Parity.None,
-                StopBits = StopBits.One
+                StopBits = StopBits.One,
+                WriteTimeout = 2000,   // 读写超时：设备异常时防止串口调用无限阻塞
+                ReadTimeout = 2000
             };
             for (int i = 0; i < 3; i++)
                 _acc[i] = new int[AccWindow + 2];
@@ -99,8 +103,9 @@ namespace DisplayRotate
                 }
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error("打开串口失败", ex);
                 return false;
             }
         }
@@ -118,8 +123,9 @@ namespace DisplayRotate
                 if (_port.IsOpen)
                     _port.Close();
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error("关闭串口异常", ex);
             }
             System.Threading.Timer w = _watchdog;
             _watchdog = null;
@@ -154,6 +160,7 @@ namespace DisplayRotate
                 _countMap.Clear();
                 _lastAccUtc = DateTime.MinValue;
                 LastDirection = SensorDirection.Unknown;
+                _stateGen++;
             }
         }
 
@@ -171,8 +178,9 @@ namespace DisplayRotate
                 _port.Write(cmd, 0, cmd.Length);
                 return _ackEvent.Wait(3000);
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error("串口写入/等待应答异常", ex);
                 return false;
             }
             finally
@@ -193,6 +201,7 @@ namespace DisplayRotate
 
         private void OnDataReceived(object sender, SerialDataReceivedEventArgs e)
         {
+            List<Action> pending = null;
             try
             {
                 int n = _port.BytesToRead;
@@ -206,17 +215,36 @@ namespace DisplayRotate
                 {
                     for (int i = 0; i < read; i++)
                         _rx.Add(buf[i]);
-                    ProcessBuffer();
+                    pending = ProcessBuffer();
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Log.Error("串口数据接收异常", ex);
                 SetReady(false);
+            }
+
+            // 事件统一在锁外触发：避免持有 _lock 时回调 UI，防止阻塞串口接收线程或造成死锁。
+            // 若期间发生过 Open/Close（代数变化），说明这些事件已过期，直接丢弃。
+            if (pending != null && _pendingGen == _stateGen)
+            {
+                for (int i = 0; i < pending.Count; i++)
+                {
+                    try
+                    {
+                        pending[i]();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("传感器事件回调异常", ex);
+                    }
+                }
             }
         }
 
         private void OnErrorReceived(object sender, SerialErrorReceivedEventArgs e)
         {
+            Log.Error("串口错误事件（帧错误/溢出等）", null);
             SetReady(false);
         }
 
@@ -231,15 +259,17 @@ namespace DisplayRotate
                 SetReady(false);
         }
 
-        private void ProcessBuffer()
+        private List<Action> ProcessBuffer()
         {
+            List<Action> pending = new List<Action>();
+            _pendingGen = _stateGen;
             while (_rx.Count >= 5)
             {
                 int idx = _rx.IndexOf(0xA4);
                 if (idx < 0)
                 {
                     _rx.Clear();
-                    return;
+                    return pending;
                 }
                 if (idx > 0)
                     _rx.RemoveRange(0, idx);
@@ -257,15 +287,16 @@ namespace DisplayRotate
                 }
 
                 if (_rx.Count < total)
-                    return;
+                    return pending;
 
                 byte[] frame = _rx.GetRange(0, total).ToArray();
                 _rx.RemoveRange(0, total);
-                HandleFrame(frame);
+                HandleFrame(frame, pending);
             }
+            return pending;
         }
 
-        private void HandleFrame(byte[] frame)
+        private void HandleFrame(byte[] frame, List<Action> pending)
         {
             if (!Checksum(frame))
                 return;
@@ -277,7 +308,7 @@ namespace DisplayRotate
 
             // 加速度帧：A4 03 08 06 + X/Y/Z 各 2 字节 + 校验和
             if (frame.Length == 11 && frame[1] == 0x03 && frame[2] == 0x08 && frame[3] == 0x06)
-                HandleAcc(frame);
+                HandleAcc(frame, pending);
         }
 
         private static bool Checksum(byte[] b)
@@ -314,10 +345,12 @@ namespace DisplayRotate
             return false;
         }
 
-        private void HandleAcc(byte[] frame)
+        private void HandleAcc(byte[] frame, List<Action> pending)
         {
             _lastAccUtc = DateTime.UtcNow;
-            SetReady(true);
+            if (!_ready)
+                pending.Add(delegate { RaiseReadyChanged(true); });
+            _ready = true;
 
             int ix = (short)((frame[4] << 8) | frame[5]);
             int iy = (short)((frame[6] << 8) | frame[7]);
@@ -333,43 +366,38 @@ namespace DisplayRotate
             _acc[1][_accIndex] = iy;
             _acc[2][_accIndex] = iz;
 
-            int qx = 0, qy = 0, qz = 0;
+            int qx = 0, qy = 0;
             if (_accCount > 0)
             {
-                long sx = 0, sy = 0, sz = 0;
+                long sx = 0, sy = 0;
                 for (int i = 0; i < _accCount; i++)
                 {
                     sx += _acc[0][i];
                     sy += _acc[1][i];
-                    sz += _acc[2][i];
                 }
                 qx = (int)Math.Round((sx / (double)_accCount) / 160.0);
                 qy = (int)Math.Round((sy / (double)_accCount) / 160.0);
-                qz = (int)Math.Round((sz / (double)_accCount) / 160.0);
             }
 
-            string key = qx + "-" + qy + "-" + qz;
+            // 去抖：按「方向类别」计数，同方向连续满 20 帧才触发一次旋转；
+            // 方向一变就清空重新计数，避免过渡期抖动反复触发。
+            SensorDirection dir = GetDirection(qx, qy);
             int count;
-            if (!_countMap.TryGetValue(key, out count))
+            if (!_countMap.TryGetValue(dir, out count))
             {
                 _countMap.Clear();
-                _countMap[key] = 1;
+                _countMap[dir] = 1;
             }
             else
             {
                 if (count == 20)
                 {
-                    SensorDirection dir = GetDirection(qx, qy);
                     LastDirection = dir;
                     if (dir != SensorDirection.Unknown)
-                    {
-                        Action<SensorDirection> h = Rotated;
-                        if (h != null)
-                            h(dir);
-                    }
+                        pending.Add(delegate { RaiseRotated(dir); });
                 }
                 if (count < 100)
-                    _countMap[key] = count + 1;
+                    _countMap[dir] = count + 1;
             }
         }
 
@@ -391,11 +419,21 @@ namespace DisplayRotate
             bool changed = _ready != value;
             _ready = value;
             if (changed)
-            {
-                Action<bool> h = ReadyChanged;
-                if (h != null)
-                    h(value);
-            }
+                RaiseReadyChanged(value);
+        }
+
+        private void RaiseReadyChanged(bool value)
+        {
+            Action<bool> h = ReadyChanged;
+            if (h != null)
+                h(value);
+        }
+
+        private void RaiseRotated(SensorDirection dir)
+        {
+            Action<SensorDirection> h = Rotated;
+            if (h != null)
+                h(dir);
         }
 
         public void Dispose()
