@@ -49,6 +49,16 @@ GY-25T              USB-TTL
 
 > 提示：部分 GY-25T 模块板载稳压与电平转换，可直连 5V；否则请按模块标注使用 3.3V，并保证与串口模块电平一致。
 
+**选购参考**（GY-25T 模块与 USB 转 TTL 模块）：
+
+![GY-25T 模块与 USB 转 TTL 模块（选购参考）](pic/hardware/buy-reference.jpg)
+
+**硬件实物**：
+
+![硬件实物照片 1](pic/hardware/gy25t-photo-1.jpg)
+
+![硬件实物照片 2](pic/hardware/gy25t-photo-2.jpg)
+
 ## 代码构建
 
 **方式一（推荐，无需任何开发环境）**：双击 `build.bat`。脚本调用系统自带的 .NET Framework C# 编译器（`csc.exe`）编译源码并内嵌图标资源，产物为当前目录下的 `DisplayRotate.exe`。
@@ -69,6 +79,8 @@ GY-25T              USB-TTL
 无需安装任何运行时或第三方库。
 
 ## 使用说明
+
+![主界面预览](pic/app-ui.jpg)
 
 1. 运行 `DisplayRotate.exe`
 2. 点击「扫描」选择传感器所在串口（如 `COM3  USB-SERIAL CH340`），点「打开」
@@ -99,5 +111,5 @@ DisplayRotate/
 ├── SettingsStore.cs      # 注册表设置存取
 ├── RoundedPanel.cs       # 圆角卡片 UI 控件
 ├── IconFactory.cs        # 多尺寸高清图标生成
-└── pic/                  # 状态图标源图（logo-green / logo-red）
+└── pic/                  # 状态图标与硬件/界面配图
 ```
