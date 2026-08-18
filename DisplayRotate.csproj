@@ -5,6 +5,7 @@
     <LangVersion>5</LangVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>DisplayRotate</AssemblyName>
+    <ApplicationIcon>pic\app.ico</ApplicationIcon>
     <RootNamespace>DisplayRotate</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>

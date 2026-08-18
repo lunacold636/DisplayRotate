@@ -9,6 +9,7 @@ if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.ex
   /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll ^
   /resource:pic\logo-green.png,DisplayRotate.logoGreen.png ^
   /resource:pic\logo-red.png,DisplayRotate.logoRed.png ^
+  /win32icon:pic\app.ico ^
   Program.cs Log.cs SettingsStore.cs RoundedPanel.cs DisplayRotator.cs Gy25t.cs IconFactory.cs MainForm.cs
 
 if %errorlevel%==0 (echo Build OK - DisplayRotate.exe) else (echo Build FAILED)

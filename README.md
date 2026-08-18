@@ -111,5 +111,5 @@ DisplayRotate/
 ├── SettingsStore.cs      # 注册表设置存取
 ├── RoundedPanel.cs       # 圆角卡片 UI 控件
 ├── IconFactory.cs        # 多尺寸高清图标生成
-└── pic/                  # 状态图标与硬件/界面配图
+└── pic/                  # 应用/状态图标与硬件/界面配图
 ```
