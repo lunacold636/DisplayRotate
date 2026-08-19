@@ -97,6 +97,25 @@ namespace DisplayRotate
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+        private static readonly Color WinBorderColor = Color.FromArgb(0xC9, 0xCD, 0xD4);
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ClassStyle |= 0x00020000; // CS_DROPSHADOW：无边框窗口补投影，白底下也有清晰轮廓
+                return cp;
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (Pen p = new Pen(WinBorderColor))
+                e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+        }
+
         public MainForm(bool autostart)
         {
             _autostart = autostart;
@@ -184,7 +203,9 @@ namespace DisplayRotate
             _titleBar.Paint += delegate(object s, PaintEventArgs e)
             {
                 using (Pen p = new Pen(Color.FromArgb(0xE3, 0xE7, 0xEE)))
-                    e.Graphics.DrawLine(p, 0, _titleBar.Height - 1, _titleBar.Width, _titleBar.Height - 1);
+                    e.Graphics.DrawLine(p, 0, _titleBar.Height - 1, _titleBar.Width, _titleBar.Height - 1); // 标题栏下分隔线
+                using (Pen p2 = new Pen(WinBorderColor))
+                    e.Graphics.DrawLine(p2, 0, 0, _titleBar.Width, 0); // 窗口上缘细边框
             };
 
             Label title = new Label
