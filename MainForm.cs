@@ -52,6 +52,7 @@ namespace DisplayRotate
         // 实测基准：显示器横屏 0° 时传感器方向（SensorProbe 实测 X=16 Y=-162 Z=6，稳定 7s+）
         // 映射循环序已验证：Down→Rotate270（实测）、Up→Rotate90、Right→Rotate180、Left→Default
         private const SensorDirection LandscapeDir = SensorDirection.Left;
+        private const string AppVersion = "v1.0.3"; // 发布新版本时同步更新（窗口标题栏/托盘文本显示）
 
         private readonly Gy25t _sensor = new Gy25t();
         private readonly Dictionary<SensorDirection, DisplayRotation> _rotateMap =
@@ -228,6 +229,18 @@ namespace DisplayRotate
                 BackColor = Color.White
             };
             _titleBar.Controls.Add(title);
+            // 版本号：便于判断当前运行的是哪个版本
+            Size titleSize = TextRenderer.MeasureText("DisplayRotate", title.Font);
+            Label lblVersion = new Label
+            {
+                Text = AppVersion,
+                Font = new Font("Microsoft YaHei UI", 8F),
+                ForeColor = Color.FromArgb(0x9A, 0xA2, 0xAE),
+                Location = new Point(S(16) + titleSize.Width + S(8), S(20)),
+                AutoSize = true,
+                BackColor = Color.White
+            };
+            _titleBar.Controls.Add(lblVersion);
 
             Button btnHide = MakeTitleButton("\u2014", w - S(78), S(12)); // —
             btnHide.Click += delegate { HideToTray(); };
@@ -398,12 +411,6 @@ namespace DisplayRotate
                 Activate();
             });
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("重新校准", null, delegate
-            {
-                // 以真实屏幕方向刷新"已应用"状态：手动改过方向后可重新对齐
-                ReSyncApplied();
-                UpdateDirectionLabel(_sensor.LastDirection);
-            });
             menu.Items.Add("退出", null, delegate
             {
                 _quitting = true;
@@ -415,7 +422,7 @@ namespace DisplayRotate
             {
                 ContextMenuStrip = menu,
                 Visible = true,
-                Text = "DisplayRotate - 未连接"
+                Text = "DisplayRotate " + AppVersion + " - 未连接"
             };
             _tray.DoubleClick += delegate
             {
@@ -919,7 +926,7 @@ namespace DisplayRotate
 
             _picStatus.Image = connected ? _imgGreen32 : _imgRed32;
             _lblStatus.Text = connected ? "已连接" : "未连接";
-            _tray.Text = connected ? "DisplayRotate - 已连接" : "DisplayRotate - 未连接";
+            _tray.Text = connected ? "DisplayRotate " + AppVersion + " - 已连接" : "DisplayRotate " + AppVersion + " - 未连接";
             _btnOpen.Text = connected ? "关闭" : "打开";
 
             if (connected)
