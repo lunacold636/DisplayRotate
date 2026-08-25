@@ -388,8 +388,8 @@ namespace DisplayRotate
                 AvgZ = (int)Math.Round(sz / (double)_accCount);
             }
 
-            // 去抖：按「方向类别」计数，同方向连续满 20 帧才触发一次旋转；
-            // 方向一变就清空重新计数，避免过渡期抖动反复触发。
+            // 去抖：按「方向类别」计数，同方向连续满 20 帧才更新 LastDirection（供状态轮询使用）；
+            // 方向一变就清空重新计数，避免过渡期抖动反复触发。Rotated 事件仅作通知保留，主流程不再依赖。
             SensorDirection dir = GetDirection(qx, qy);
             int count;
             if (!_countMap.TryGetValue(dir, out count))

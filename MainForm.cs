@@ -48,6 +48,10 @@ namespace DisplayRotate
         private const int ReconnectBaseMs = 2000; // 自动重连起始间隔
         private const int ReconnectMaxMs = 60000; // 自动重连最大间隔（退避封顶）
         private const int RotateCooldownMs = 2000; // 旋转后抑制窗口：防止过渡期抖动触发反向旋转/振荡
+        private const int PollIntervalMs = 500;    // 状态轮询周期：漏一次事件也能在下一轮自愈
+        // 实测基准：显示器横屏 0° 时传感器方向（SensorProbe 实测 X=16 Y=-162 Z=6，稳定 7s+）
+        // 映射循环序已验证：Down→Rotate270（实测）、Up→Rotate90、Right→Rotate180、Left→Default
+        private const SensorDirection LandscapeDir = SensorDirection.Left;
 
         private readonly Gy25t _sensor = new Gy25t();
         private readonly Dictionary<SensorDirection, DisplayRotation> _rotateMap =
@@ -56,6 +60,7 @@ namespace DisplayRotate
         private readonly object _sensorOpLock = new object(); // 串口 Open/Close/Init 互斥，避免手动关闭与自动重连竞态
         private readonly System.Windows.Forms.Timer _openTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _reconnectTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _pollTimer = new System.Windows.Forms.Timer();
         private bool _reconnectEnabled;
         private int _reconnectAttempts;
         private bool _reconnecting;
@@ -68,8 +73,8 @@ namespace DisplayRotate
         private readonly Image _imgGreen32;
         private readonly Image _imgRed32;
 
-        private bool _firstRotation = true;
-        private DateTime _lastRotateUtc = DateTime.MinValue; // 最近一次屏幕旋转时间（UTC）
+        private DisplayRotation _lastApplied = DisplayRotation.Default; // 当前已应用的屏幕旋转（轮询对比用）
+        private DateTime _lastRotateUtc = DateTime.MinValue; // 最近一次实际调用旋转的时间（UTC），仅用于冷却
         private bool _autostart;
         private bool _suppressFirstShow;
         private bool _quitting;
@@ -153,13 +158,18 @@ namespace DisplayRotate
             _openTimer.Interval = 20000; // 覆盖 Init 最长耗时（6 条指令 × 3 秒 = 18 秒）
             _openTimer.Tick += OnOpenTimeout;
             _reconnectTimer.Tick += OnReconnectTick;
+            _pollTimer.Interval = PollIntervalMs;
+            _pollTimer.Tick += OnPollTick;
+            _pollTimer.Start();
 
             BuildTray();
             BuildUi();
 
             _sensor.ReadyChanged += OnReadyChanged;
-            _sensor.Rotated += OnSensorRotated;
             Load += OnLoad;
+
+            // 写死基准（不再运行时校准）：以实测横屏方向建立固定映射
+            RebuildMap(LandscapeDir, DisplayRotation.Default);
 
             if (autostart)
             {
@@ -390,8 +400,9 @@ namespace DisplayRotate
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("重新校准", null, delegate
             {
-                _firstRotation = true;
-                UpdateDirectionLabel(SensorDirection.Unknown);
+                // 以真实屏幕方向刷新"已应用"状态：手动改过方向后可重新对齐
+                ReSyncApplied();
+                UpdateDirectionLabel(_sensor.LastDirection);
             });
             menu.Items.Add("退出", null, delegate
             {
@@ -773,32 +784,50 @@ namespace DisplayRotate
                 _openTimer.Stop();
                 StopReconnect();
                 _reconnectAttempts = 0;
-                // 每次（重新）连接后都重新校准，避免手动改过屏幕方向后映射过期
-                _firstRotation = true;
+                // 以真实屏幕方向作为"已应用"初值，避免启动即误转；若与传感器不符，轮询会自动纠正
+                ReSyncApplied();
                 SettingsStore.Port = _sensor.PortName;
                 SettingsStore.Description = GetPortDescription(_sensor.PortName);
             }
             else
             {
-                _firstRotation = true;
                 if (!_manualClosePending && !_reconnecting)
                     StartReconnect();
             }
             SetStatus(ready);
         }
 
-        private void OnSensorRotated(SensorDirection dir)
+        /// <summary>状态驱动轮询：定期按传感器当前方向校正屏幕旋转。漏一次事件也能自愈；冷却只跳过不吞。</summary>
+        private void OnPollTick(object sender, EventArgs e)
         {
             if (_quitting) return; // 退出中：不再旋转屏幕
-            // 旋转涉及阻塞的 Win32 调用，统一切到 UI 线程执行，避免占住串口接收线程
-            if (InvokeRequired)
-            {
-                BeginInvoke((Action)delegate { OnSensorRotated(dir); });
+            if (!_sensor.IsOpen || !_sensor.IsReady)
                 return;
-            }
 
             string monitor = _selectedMonitor;
             if (string.IsNullOrEmpty(monitor))
+                return;
+
+            SensorDirection dir = _sensor.LastDirection;
+            if (dir == SensorDirection.Unknown)
+                return; // 传感器未稳定/正在过渡：保持现状，等待去抖完成
+
+            DisplayRotation expected;
+            lock (_rotateLock)
+            {
+                if (!_rotateMap.TryGetValue(dir, out expected))
+                    return;
+            }
+
+            if (expected == _lastApplied)
+            {
+                UpdateDirectionLabel(dir);
+                return;
+            }
+
+            // 冷却期：跳过本次但不吞掉状态差，下一轮轮询自动重试（自愈）
+            DateTime now = DateTime.UtcNow;
+            if ((now - _lastRotateUtc).TotalMilliseconds < RotateCooldownMs)
             {
                 UpdateDirectionLabel(dir);
                 return;
@@ -806,46 +835,39 @@ namespace DisplayRotate
 
             try
             {
-                if (_firstRotation)
+                if (DisplayRotator.Rotate(monitor, expected))
                 {
-                    // 首次校准：以当前屏幕方向建立「传感器方向 → 屏幕旋转」映射
-                    lock (_rotateLock)
-                    {
-                        DisplayRotation r2 = DisplayRotator.GetRotation(monitor);
-                        RebuildMap(dir, r2);
-                        _firstRotation = false;
-                    }
-                    UpdateDirectionLabel(dir);
-                    return;
+                    _lastApplied = expected;
+                    _lastRotateUtc = now;
                 }
-
-                // 旋转后抑制窗口：屏幕切换模式时的过渡读数可能触发反向旋转，短暂忽略
-                DateTime now = DateTime.UtcNow;
-                if ((now - _lastRotateUtc).TotalMilliseconds < RotateCooldownMs)
-                {
-                    UpdateDirectionLabel(dir);
-                    return;
-                }
-
-                DisplayRotation rr;
-                lock (_rotateLock)
-                {
-                    if (!_rotateMap.TryGetValue(dir, out rr))
-                    {
-                        UpdateDirectionLabel(dir);
-                        return;
-                    }
-                }
-                _lastRotateUtc = now;
-                DisplayRotator.Rotate(monitor, rr);
-                UpdateDirectionLabel(dir);
+                // 失败不更新 _lastApplied：下一轮轮询会重试
             }
             catch (Exception ex)
             {
                 Log.Error("屏幕旋转异常", ex);
             }
+            UpdateDirectionLabel(dir);
         }
 
+        /// <summary>以真实屏幕方向刷新"已应用"状态（连接成功 / 切换监视器 / 手动重新校准）。</summary>
+        private void ReSyncApplied()
+        {
+            if (string.IsNullOrEmpty(_selectedMonitor))
+            {
+                _lastApplied = DisplayRotation.Default;
+                return;
+            }
+            try
+            {
+                _lastApplied = DisplayRotator.GetRotation(_selectedMonitor);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("读取屏幕方向失败", ex);
+            }
+        }
+
+        /// <summary>按循环序建立固定映射。启动时以实测横屏基准调用一次，之后不再运行时校准。</summary>
         private void RebuildMap(SensorDirection r1, DisplayRotation r2)
         {
             SensorDirection[] dirs = new SensorDirection[]
@@ -953,7 +975,10 @@ namespace DisplayRotate
             ComboItem item = _cmbMonitor.SelectedItem as ComboItem;
             _selectedMonitor = item == null ? "" : item.Port;
             if (!string.IsNullOrEmpty(_selectedMonitor))
+            {
                 SettingsStore.Monitor = _selectedMonitor;
+                ReSyncApplied(); // 切换监视器后以真实方向为基准，避免基于旧屏幕误转
+            }
         }
 
         private string GetSelectedPort()
@@ -1070,9 +1095,9 @@ namespace DisplayRotate
             {
                 _openTimer.Stop();
                 _reconnectTimer.Stop();
-                // 先摘掉事件订阅：Dispose 串口会同步触发 ReadyChanged(false)/Rotated，避免回调访问已置空的 _tray
+                _pollTimer.Stop();
+                // 先摘掉事件订阅：Dispose 串口会同步触发 ReadyChanged(false)，避免回调访问已置空的 _tray
                 _sensor.ReadyChanged -= OnReadyChanged;
-                _sensor.Rotated -= OnSensorRotated;
                 if (_tray != null)
                 {
                     _tray.Visible = false;
