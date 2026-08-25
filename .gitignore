@@ -1,4 +1,5 @@
 DisplayRotate.exe
+tools/SensorProbe.exe
 bin/
 obj/
 DisplayRotate.log
