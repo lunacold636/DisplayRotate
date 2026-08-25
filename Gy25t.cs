@@ -59,6 +59,11 @@ namespace DisplayRotate
 
         public SensorDirection LastDirection { get; private set; }
 
+        /// <summary>最近 AccWindow 帧的平均加速度（单位 0.01g，1g≈160）。供基准探测/调试用。</summary>
+        public int AvgX { get; private set; }
+        public int AvgY { get; private set; }
+        public int AvgZ { get; private set; }
+
         public event Action<bool> ReadyChanged;
         public event Action<SensorDirection> Rotated;
 
@@ -369,14 +374,18 @@ namespace DisplayRotate
             int qx = 0, qy = 0;
             if (_accCount > 0)
             {
-                long sx = 0, sy = 0;
+                long sx = 0, sy = 0, sz = 0;
                 for (int i = 0; i < _accCount; i++)
                 {
                     sx += _acc[0][i];
                     sy += _acc[1][i];
+                    sz += _acc[2][i];
                 }
                 qx = (int)Math.Round((sx / (double)_accCount) / 160.0);
                 qy = (int)Math.Round((sy / (double)_accCount) / 160.0);
+                AvgX = (int)Math.Round(sx / (double)_accCount);
+                AvgY = (int)Math.Round(sy / (double)_accCount);
+                AvgZ = (int)Math.Round(sz / (double)_accCount);
             }
 
             // 去抖：按「方向类别」计数，同方向连续满 20 帧才触发一次旋转；
