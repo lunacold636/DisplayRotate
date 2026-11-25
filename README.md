@@ -1,12 +1,17 @@
 # DisplayRotate
 
-基于 GY-25T 加速度计的 Windows 屏幕自动旋转工具。C# / WinForms 实现，单文件约 28KB，无需安装任何运行时，Win10 / Win11 直接运行。
+基于 GY-25T 加速度计的屏幕自动旋转工具，提供 Windows 与 macOS 两个平台的实现。
 
 把 GY-25T 模块固定在屏幕或支架上，屏幕即可跟随设备姿态自动旋转，适合平板、触控屏、可旋转支架等场景。
 
-> **macOS 版本**：见 [`macos/`](macos/README.md)。原生 Swift / AppKit 菜单栏应用，逻辑与本文的 Windows 版一致，旋转走系统私有接口 `SLSSetDisplayRotation`。
+| 平台 | 实现 | 产物 | 说明 |
+| --- | --- | --- | --- |
+| Windows 10 / 11 | C# / WinForms（net48） | `windows/DisplayRotate.exe`，约 28KB | 免装运行时，系统自带 .NET Framework |
+| macOS 14+ | Swift / AppKit（菜单栏应用） | `macos/build/DisplayRotate.app`，约 500KB | 无第三方依赖，旋转走系统私有接口 |
 
-## 功能
+两个平台共用同一套 GY-25T 协议解析与方向判定逻辑，时序参数（轮询 500ms、旋转冷却 2s、看门狗 5s、重连 2s→60s）保持一致。
+
+## Windows 版功能
 
 - 串口扫描与连接（GY-25T，9600 8N1），自动识别并显示 COM 口设备名称
 - 多显示器支持：选择要自动旋转的显示器
@@ -53,25 +58,25 @@ GY-25T              USB-TTL
 
 **选购参考**（GY-25T 模块与 USB 转 TTL 模块）：
 
-![GY-25T 模块与 USB 转 TTL 模块（选购参考）](pic/hardware/buy-reference.jpg)
+![GY-25T 模块与 USB 转 TTL 模块（选购参考）](windows/pic/hardware/buy-reference.jpg)
 
 **硬件实物**：
 
-![硬件实物照片 1](pic/hardware/gy25t-photo-1.jpg)
+![硬件实物照片 1](windows/pic/hardware/gy25t-photo-1.jpg)
 
-![硬件实物照片 2](pic/hardware/gy25t-photo-2.jpg)
+![硬件实物照片 2](windows/pic/hardware/gy25t-photo-2.jpg)
 
-## 代码构建
+## Windows 版构建
 
-**方式一（推荐，无需任何开发环境）**：双击 `build.bat`。脚本调用系统自带的 .NET Framework C# 编译器（`csc.exe`）编译源码并内嵌图标资源，产物为当前目录下的 `DisplayRotate.exe`。
+**方式一（推荐，无需任何开发环境）**：双击 `windows/build.bat`。脚本调用系统自带的 .NET Framework C# 编译器（`csc.exe`）编译源码并内嵌图标资源，产物为当前目录下的 `DisplayRotate.exe`。
 
-**方式二**：用 Visual Studio（或 VS Code + .NET Framework 4.8 开发包）打开 `DisplayRotate.csproj` 构建，目标框架 `net48`。
+**方式二**：用 Visual Studio（或 VS Code + .NET Framework 4.8 开发包）打开 `windows/DisplayRotate.csproj` 构建，目标框架 `net48`。
 
 ```
-构建产物：DisplayRotate.exe（单文件，约 28KB）
+构建产物：windows/DisplayRotate.exe（单文件，约 28KB）
 ```
 
-## 运行依赖
+## Windows 运行依赖
 
 - Windows 10 / Windows 11（32/64 位均可）
 - .NET Framework 4.8（系统自带，无需额外安装）
@@ -80,11 +85,11 @@ GY-25T              USB-TTL
 
 无需安装任何运行时或第三方库。
 
-## 使用说明
+## Windows 版使用说明
 
-![主界面预览](pic/app-ui.jpg)
+![主界面预览](windows/pic/app-ui.jpg)
 
-1. 运行 `DisplayRotate.exe`
+1. 运行 `windows/DisplayRotate.exe`
 2. 点击「扫描」选择传感器所在串口（如 `COM3  USB-SERIAL CH340`），点「打开」
 3. 在「监视器」下拉框选择要自动旋转的显示器（多显示器场景）
 4. 连接成功后界面与托盘图标变绿，屏幕随设备姿态自动旋转
@@ -95,23 +100,48 @@ GY-25T              USB-TTL
 ## 常见问题
 
 - **打开失败 / 传感器无响应**：检查 TX/RX 是否交叉、是否共地，确认串口驱动已安装且选择了正确的 COM 口。
-- **旋转方向反了**：交换 `Gy25t.cs` 中 `XUp` / `XDown` 两个常量，重新编译。
+- **旋转方向反了**：交换 `windows/Gy25t.cs` 中 `XUp` / `XDown` 两个常量，重新编译。
 - **旋转时屏幕短暂黑屏**：显卡驱动切换显示模式的系统级行为，属正常现象。
 - **多屏选错显示器**：在「监视器」下拉框选择对应设备即可，设置会自动记住。
+
+## macOS 版
+
+原生 Swift / AppKit 菜单栏应用，完整说明见 [`macos/README.md`](macos/README.md)。
+
+- 菜单栏常驻：左键点图标打开设置窗口，右键弹出菜单（连接 / 一键复位 / 退出）
+- 目标显示器选择：内置屏无法旋转，已自动从列表剔除
+- 一键复位：把屏幕转回可配置的基准角度（0°/90°/180°/270°），传感器未接入时也能用
+- 开机自启（LaunchAgent）、单实例、自动重连、模拟传感器调试、文件日志
+
+```bash
+cd macos && ./build.sh              # Apple Silicon
+cd macos && ./build.sh --universal  # Intel + Apple Silicon
+```
+
+旋转使用系统私有接口 `SLSSetDisplayRotation`（SkyLight），不可上架 App Store，适合本机使用或直接分发。
 
 ## 目录结构
 
 ```
 DisplayRotate/
-├── build.bat             # 一键构建脚本（使用系统自带 csc.exe）
-├── DisplayRotate.csproj  # VS 工程文件（net48 / WinForms）
-├── Program.cs            # 入口：DPI 感知、单实例、全局异常兜底、--autostart 参数
-├── Log.cs                # 轻量文件日志（异常诊断）
-├── MainForm.cs           # 主界面 / 托盘 / 串口扫描 / 开机自启
-├── DisplayRotator.cs     # Win32 显示器枚举与旋转
-├── Gy25t.cs              # GY-25T 串口协议解析与方向判定
-├── SettingsStore.cs      # 注册表设置存取
-├── RoundedPanel.cs       # 圆角卡片 UI 控件
-├── IconFactory.cs        # 多尺寸高清图标生成
-└── pic/                  # 应用/状态图标与硬件/界面配图
+├── README.md                 # 项目总览（本文件）
+├── LICENSE
+├── windows/                  # Windows 版（C# / WinForms，net48）
+│   ├── build.bat             # 一键构建脚本（使用系统自带 csc.exe）
+│   ├── DisplayRotate.csproj  # VS 工程文件（net48 / WinForms）
+│   ├── Program.cs            # 入口：DPI 感知、单实例、全局异常兜底、--autostart 参数
+│   ├── Log.cs                # 轻量文件日志（异常诊断）
+│   ├── MainForm.cs           # 主界面 / 托盘 / 串口扫描 / 开机自启
+│   ├── DisplayRotator.cs     # Win32 显示器枚举与旋转
+│   ├── Gy25t.cs              # GY-25T 串口协议解析与方向判定
+│   ├── SettingsStore.cs      # 注册表设置存取
+│   ├── RoundedPanel.cs       # 圆角卡片 UI 控件
+│   ├── IconFactory.cs        # 多尺寸高清图标生成
+│   ├── tools/                # SensorProbe 传感器基准探测工具
+│   └── pic/                  # 应用/状态图标与硬件/界面配图
+└── macos/                    # macOS 版（Swift / AppKit 菜单栏）
+    ├── build.sh              # 一键构建脚本
+    ├── Info.plist            # LSUIElement（无 Dock 图标）
+    ├── Sources/              # Swift 源码（15 个文件）
+    └── README.md             # macOS 版说明
 ```

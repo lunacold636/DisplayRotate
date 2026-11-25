@@ -2,7 +2,7 @@
 
 GY-25T 加速度计驱动的 macOS 屏幕自动旋转工具。原生 Swift / AppKit 实现，常驻菜单栏，无 Dock 图标、无第三方运行时。
 
-> Windows 版见仓库根目录（C# / WinForms）。两端共享同一套协议解析与方向判定逻辑。
+> Windows 版见 [`../windows/`](../windows/)（C# / WinForms）。两端共享同一套协议解析与方向判定逻辑。
 
 ## 功能
 
