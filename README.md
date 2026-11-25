@@ -4,6 +4,8 @@
 
 把 GY-25T 模块固定在屏幕或支架上，屏幕即可跟随设备姿态自动旋转，适合平板、触控屏、可旋转支架等场景。
 
+> **macOS 版本**：见 [`macos/`](macos/README.md)。原生 Swift / AppKit 菜单栏应用，逻辑与本文的 Windows 版一致，旋转走系统私有接口 `SLSSetDisplayRotation`。
+
 ## 功能
 
 - 串口扫描与连接（GY-25T，9600 8N1），自动识别并显示 COM 口设备名称

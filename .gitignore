@@ -4,3 +4,7 @@ bin/
 obj/
 DisplayRotate.log
 .idea/
+
+# macOS 版构建产物
+macos/build/
+macos/.module-cache/
