@@ -39,6 +39,9 @@ else
 fi
 
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+if [[ -f "$ROOT/AppIcon.icns" ]]; then
+    cp "$ROOT/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 echo "==> ad-hoc 签名"

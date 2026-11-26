@@ -6,6 +6,8 @@
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
     <string>DisplayRotate</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.luyanjia.DisplayRotate</string>
     <key>CFBundleInfoDictionaryVersion</key>
