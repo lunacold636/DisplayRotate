@@ -107,6 +107,12 @@ enum SerialError: LocalizedError {
     }
 }
 
+enum SerialReadResult {
+    case data(Data)
+    case timeout
+    case disconnected(Int32)
+}
+
 /// 基于 POSIX termios 的串口封装，9600 8N1、raw 模式。
 final class SerialPort {
     let path: String
@@ -180,21 +186,38 @@ final class SerialPort {
         }
     }
 
-    /// 带超时的读取；返回空 Data 表示本轮无数据。
-    func readChunk(timeoutMs: Int32 = 100) -> Data {
+    /// 带超时的读取；区分正常数据、超时空闲与设备异常断开。
+    func readChunk(timeoutMs: Int32 = 100) -> SerialReadResult {
         lock.lock()
         let handle = fd
         lock.unlock()
-        guard handle >= 0 else { return Data() }
+        guard handle >= 0 else { return .disconnected(0) }
 
         var pfd = pollfd(fd: handle, events: Int16(POLLIN), revents: 0)
         let ready = poll(&pfd, 1, timeoutMs)
-        guard ready > 0 else { return Data() }
+        if ready == 0 { return .timeout }
+        if ready < 0 {
+            if errno == EINTR || errno == EAGAIN { return .timeout }
+            return .disconnected(errno)
+        }
+        if (pfd.revents & Int16(POLLERR | POLLHUP | POLLNVAL)) != 0 {
+            return .disconnected(0)
+        }
+        guard (pfd.revents & Int16(POLLIN)) != 0 else { return .timeout }
 
         var buffer = [UInt8](repeating: 0, count: 4096)
         let count = Darwin.read(handle, &buffer, buffer.count)
-        guard count > 0 else { return Data() }
-        return Data(buffer[0..<count])
+        if count > 0 {
+            return .data(Data(buffer[0..<count]))
+        }
+        if count == 0 {
+            // POLLIN 就绪但 read 返回 0（EOF）：设备被拔出或 USB 串口已重置
+            return .disconnected(0)
+        }
+        if errno == EAGAIN || errno == EINTR {
+            return .timeout
+        }
+        return .disconnected(errno)
     }
 
     func close() {

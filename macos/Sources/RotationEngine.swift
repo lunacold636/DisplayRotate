@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// 旋转引擎：串口 + 协议 + 方向映射 + 屏幕旋转，行为对齐 Windows 版 MainForm。
@@ -9,6 +10,8 @@ final class RotationEngine {
         static let rotateCooldown: TimeInterval = 2.0    // 旋转后抑制窗口
         static let watchdogPeriod: TimeInterval = 1.0    // 看门狗检查周期
         static let watchdogTimeout: TimeInterval = 5.0   // 超过 5 秒无有效帧判定离线
+        static let initGraceTimeout: TimeInterval = 5.0  // 初始化完成后等待首帧超时
+        static let wakeReconnectDelay: TimeInterval = 1.5
         static let reconnectBase: TimeInterval = 2.0     // 自动重连起始间隔
         static let reconnectMax: TimeInterval = 60.0     // 重连退避封顶
         static let commandTimeout: TimeInterval = 3.0    // 单条指令等待应答
@@ -37,7 +40,11 @@ final class RotationEngine {
     // MARK: 内部状态
 
     private var port: SerialPort?
+    private var generation: Int = 0
     private var readLoopActive = false
+    private var initializing = false
+    private var initFinishedAt: Date?
+    private var isSleeping = false
     private var rotateMap: [SensorDirection: DisplayRotation] = [:]
     private var lastRotateAt = Date.distantPast
     private var pollTimer: Timer?
@@ -46,7 +53,8 @@ final class RotationEngine {
     private var reconnectAttempts = 0
     private var reconnectEnabled = false
     private var manualClose = false
-    private var initializing = false
+    private var activityToken: NSObjectProtocol?
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     // MARK: 生命周期
 
@@ -63,12 +71,18 @@ final class RotationEngine {
             DispatchQueue.main.async { self?.handleReady(ready) }
         }
         parser.onAck = { [weak self] in
-            self?.ackSemaphore.signal()
+            guard let self else { return }
+            self.stateLock.lock()
+            let sem = self.ackSemaphore
+            self.stateLock.unlock()
+            sem.signal()
         }
 
         displayManager.onReconfiguration = { [weak self] in
             DispatchQueue.main.async { self?.handleReconfiguration() }
         }
+
+        registerSleepWakeObservers()
 
         pollTimer = Timer.scheduledTimer(withTimeInterval: Timing.pollInterval, repeats: true) { [weak self] _ in
             self?.pollTick()
@@ -84,10 +98,80 @@ final class RotationEngine {
 
     func shutdown() {
         manualClose = true
+        unregisterSleepWakeObservers()
         stopReconnect()
         closePort()
+        endActivityAssertion()
         pollTimer?.invalidate(); pollTimer = nil
         watchdogTimer?.invalidate(); watchdogTimer = nil
+    }
+
+    // MARK: App Nap 豁免与休眠唤醒
+
+    /// 在传感器处于运行或自动重连状态时豁免 macOS App Nap，同时允许系统正常空闲休眠。
+    private func updateActivityAssertion() {
+        let shouldKeepAwake = isConnected || reconnectEnabled
+        if shouldKeepAwake, activityToken == nil {
+            activityToken = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Monitor GY-25T orientation sensor over serial port"
+            )
+        } else if !shouldKeepAwake {
+            endActivityAssertion()
+        }
+    }
+
+    private func endActivityAssertion() {
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
+    }
+
+    private func registerSleepWakeObservers() {
+        unregisterSleepWakeObservers()
+        let center = NSWorkspace.shared.notificationCenter
+        let sleepObserver = center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleWillSleep()
+        }
+        let wakeObserver = center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleDidWake()
+        }
+        workspaceObservers = [sleepObserver, wakeObserver]
+    }
+
+    private func unregisterSleepWakeObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in workspaceObservers {
+            center.removeObserver(observer)
+        }
+        workspaceObservers.removeAll()
+    }
+
+    private func handleWillSleep() {
+        isSleeping = true
+        Log.info("系统即将休眠，暂停传感器看门狗")
+    }
+
+    private func handleDidWake() {
+        isSleeping = false
+        parser.touchWatchdog()
+        if initFinishedAt != nil {
+            initFinishedAt = Date()
+        }
+        Log.info("系统已唤醒，恢复传感器监测")
+        if !manualClose && reconnectEnabled && !(isConnected && isReady) {
+            reconnectAttempts = 0
+            scheduleReconnect(delayOverride: Timing.wakeReconnectDelay)
+        }
     }
 
     // MARK: 端口
@@ -139,12 +223,15 @@ final class RotationEngine {
 
     // MARK: 连接
 
-    func connect(path: String) {
+    func connect(path: String, resetBackoff: Bool = true) {
         guard !isConnected else { return }
         manualClose = false
         reconnectEnabled = false
         reconnectTimer?.invalidate()
-        reconnectAttempts = 0
+        reconnectTimer = nil
+        if resetBackoff {
+            reconnectAttempts = 0
+        }
 
         let serial = SerialPort(path: path)
         do {
@@ -155,9 +242,17 @@ final class RotationEngine {
             return
         }
 
+        stateLock.lock()
+        generation &+= 1
+        let currentGen = generation
         port = serial
+        readLoopActive = true
+        initializing = true
+        stateLock.unlock()
+
         isConnected = true
         isReady = false
+        initFinishedAt = nil
         lastDirection = .unknown
         parser.reset()
         Prefs.port = path
@@ -165,8 +260,9 @@ final class RotationEngine {
             Prefs.portDescription = device.product
         }
         resyncApplied()
-        startReadLoop()
-        runInitSequence()
+        updateActivityAssertion()
+        startReadLoop(generation: currentGen, serial: serial)
+        runInitSequence(generation: currentGen, serial: serial)
         onChange?()
     }
 
@@ -174,6 +270,7 @@ final class RotationEngine {
         manualClose = manual
         stopReconnect()
         closePort()
+        updateActivityAssertion()
         onChange?()
     }
 
@@ -187,58 +284,114 @@ final class RotationEngine {
 
     private func closePort() {
         stateLock.lock()
+        generation &+= 1
         readLoopActive = false
+        initializing = false
+        let oldPort = port
+        port = nil
+        let sem = ackSemaphore
         stateLock.unlock()
 
-        port?.close()
-        port = nil
+        sem.signal()
+        oldPort?.close()
         isConnected = false
         isReady = false
+        initFinishedAt = nil
         lastDirection = .unknown
         parser.reset()
     }
 
-    private func startReadLoop() {
+    private func isCurrentGeneration(_ gen: Int) -> Bool {
         stateLock.lock()
-        readLoopActive = true
-        stateLock.unlock()
+        defer { stateLock.unlock() }
+        return generation == gen && readLoopActive
+    }
 
+    private func startReadLoop(generation gen: Int, serial: SerialPort) {
         ioQueue.async { [weak self] in
             guard let self else { return }
-            while true {
-                self.stateLock.lock()
-                let active = self.readLoopActive
-                self.stateLock.unlock()
-                guard active, let serial = self.port else { break }
+            var unexpectedDisconnect: Int32?
 
-                let data = serial.readChunk(timeoutMs: 100)
-                if data.isEmpty {
+            while self.isCurrentGeneration(gen) {
+                switch serial.readChunk(timeoutMs: 100) {
+                case let .data(data):
+                    guard self.isCurrentGeneration(gen) else { break }
+                    self.parser.feed(data)
+                case .timeout:
                     if !serial.isOpen { break }
-                    continue
+                case let .disconnected(code):
+                    if self.isCurrentGeneration(gen) {
+                        unexpectedDisconnect = code
+                    }
+                    break
                 }
-                self.parser.feed(data)
+                if unexpectedDisconnect != nil || !serial.isOpen {
+                    break
+                }
             }
+
             Log.info("串口读取循环结束")
+            if let code = unexpectedDisconnect {
+                DispatchQueue.main.async { [weak self] in
+                    self?.handlePortDisconnected(generation: gen, errnoCode: code)
+                }
+            }
         }
     }
 
-    private func runInitSequence() {
-        guard !initializing else { return }
-        initializing = true
+    private func handlePortDisconnected(generation gen: Int, errnoCode: Int32) {
+        stateLock.lock()
+        let matches = (generation == gen)
+        stateLock.unlock()
+        guard matches else { return }
+
+        if errnoCode != 0 {
+            Log.error("串口异常断开（errno \(errnoCode)：\(String(cString: strerror(errnoCode)))）")
+        } else {
+            Log.error("串口已断开（设备可能被拔出或重置）")
+        }
+
+        closePort()
+        onChange?()
+        if !manualClose {
+            scheduleReconnect()
+        } else {
+            updateActivityAssertion()
+        }
+    }
+
+    private func runInitSequence(generation gen: Int, serial: SerialPort) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             for command in Gy25tCommand.initialize {
-                guard self.port != nil else { break }
-                _ = self.writeSync(command)
+                guard self.isCurrentGeneration(gen) else { return }
+                _ = self.writeSync(command, generation: gen, serial: serial)
             }
-            self.initializing = false
-            Log.info("GY-25T 初始化指令发送完成")
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let stillCurrent = (self.generation == gen)
+                if stillCurrent { self.initializing = false }
+                self.stateLock.unlock()
+                guard stillCurrent else { return }
+
+                self.initFinishedAt = Date()
+                self.parser.touchWatchdog()
+                Log.info("GY-25T 初始化指令发送完成")
+            }
         }
     }
 
-    private func writeSync(_ command: [UInt8]) -> Bool {
-        guard let serial = port else { return false }
-        ackSemaphore = DispatchSemaphore(value: 0)
+    private func writeSync(_ command: [UInt8], generation gen: Int, serial: SerialPort) -> Bool {
+        let sem = DispatchSemaphore(value: 0)
+        stateLock.lock()
+        guard generation == gen else {
+            stateLock.unlock()
+            return false
+        }
+        ackSemaphore = sem
+        stateLock.unlock()
+
         parser.pendingCommand = command
         defer { parser.pendingCommand = nil }
         do {
@@ -247,23 +400,26 @@ final class RotationEngine {
             Log.error("串口写入失败", error)
             return false
         }
-        return ackSemaphore.wait(timeout: .now() + Timing.commandTimeout) == .success
+        return sem.wait(timeout: .now() + Timing.commandTimeout) == .success
     }
 
     // MARK: 状态回调
 
     private func handleDirection(_ direction: SensorDirection) {
+        guard isConnected else { return }
         lastDirection = direction
         onChange?()
     }
 
     private func handleReady(_ ready: Bool) {
+        if ready && !isConnected { return }
         guard isReady != ready else { return }
         isReady = ready
         if ready {
             stopReconnect()
             reconnectAttempts = 0
             resyncApplied()
+            updateActivityAssertion()
         } else if !manualClose {
             scheduleReconnect()
         }
@@ -288,11 +444,27 @@ final class RotationEngine {
     }
 
     private func watchdogTick() {
-        guard isReady else { return }
-        let idle = Date().timeIntervalSince(parser.lastAccTime)
-        if idle >= Timing.watchdogTimeout {
-            Log.error("超过 \(Int(idle)) 秒无有效加速度帧，判定离线")
-            handleReady(false)
+        guard !isSleeping, isConnected else { return }
+
+        stateLock.lock()
+        let isInitializing = initializing
+        stateLock.unlock()
+        // 初始化指令序列期间模块处于查询模式，暂停看门狗避免误判
+        guard !isInitializing else { return }
+
+        if isReady {
+            let idle = Date().timeIntervalSince(parser.lastAccTime)
+            if idle >= Timing.watchdogTimeout {
+                Log.error("超过 \(Int(idle)) 秒无有效加速度帧，判定离线")
+                parser.markOffline()
+                handleReady(false)
+            }
+        } else if let finishedAt = initFinishedAt,
+                  !reconnectEnabled,
+                  Date().timeIntervalSince(finishedAt) >= Timing.initGraceTimeout {
+            Log.error("初始化完成后超过 \(Int(Timing.initGraceTimeout)) 秒未收到加速度帧，判定离线")
+            parser.markOffline()
+            scheduleReconnect()
         }
     }
 
@@ -326,29 +498,39 @@ final class RotationEngine {
 
     // MARK: 自动重连
 
-    private func scheduleReconnect() {
+    private func scheduleReconnect(delayOverride: TimeInterval? = nil) {
         guard !manualClose else { return }
         reconnectEnabled = true
         reconnectAttempts += 1
         let exponent = min(reconnectAttempts - 1, 5)
-        let delay = min(Timing.reconnectBase * pow(2, Double(exponent)), Timing.reconnectMax)
+        let delay = delayOverride ?? min(Timing.reconnectBase * pow(2, Double(exponent)), Timing.reconnectMax)
         reconnectTimer?.invalidate()
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             self?.attemptReconnect()
         }
-        Log.info("\(Int(delay)) 秒后尝试重连（第 \(reconnectAttempts) 次）")
+        updateActivityAssertion()
+        Log.info("\(Int(delay.rounded())) 秒后尝试重连（第 \(reconnectAttempts) 次）")
     }
 
     private func attemptReconnect() {
-        guard reconnectEnabled, !manualClose, !isConnected else { return }
+        guard reconnectEnabled, !manualClose else { return }
+        if isConnected && isReady {
+            stopReconnect()
+            return
+        }
+
         refreshPorts()
         guard let path = findSensorPort() else {
+            if isConnected {
+                closePort()
+                onChange?()
+            }
             scheduleReconnect()
             return
         }
+
         closePort()
-        connect(path: path)
-        if !isConnected { scheduleReconnect() }
+        connect(path: path, resetBackoff: false)
     }
 
     private func stopReconnect() {

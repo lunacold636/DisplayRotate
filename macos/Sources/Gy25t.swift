@@ -51,7 +51,7 @@ enum RotationMap {
 
 // MARK: - GY-25T 协议解析
 
-/// 移植自 Gy25t.cs：组帧/校验/加速度解析/方向判定，行为保持一致。
+/// 移植自 Gy25t.cs：组帧/校验/加速度解析/方向判定，行为保持一致（线程安全）。
 final class Gy25tParser {
     private enum Const {
         static let accWindow = 20
@@ -60,6 +60,7 @@ final class Gy25tParser {
         static let confirmFrames = 20
     }
 
+    private let lock = NSLock()
     private var rx: [UInt8] = []
     private var accX = [Int](repeating: 0, count: Const.accWindow)
     private var accY = [Int](repeating: 0, count: Const.accWindow)
@@ -68,15 +69,64 @@ final class Gy25tParser {
     private var accCount = 0
     private var countMap: [SensorDirection: Int] = [:]
 
-    private(set) var lastDirection: SensorDirection = .unknown
-    private(set) var isReady = false
-    private(set) var avgX = 0
-    private(set) var avgY = 0
-    private(set) var avgZ = 0
-    private(set) var lastAccTime: Date = .distantPast
+    private var _lastDirection: SensorDirection = .unknown
+    private var _isReady = false
+    private var _avgX = 0
+    private var _avgY = 0
+    private var _avgZ = 0
+    private var _lastAccTime: Date = .distantPast
+    private var _pendingCommand: [UInt8]?
+
+    var lastDirection: SensorDirection {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastDirection
+    }
+
+    var isReady: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isReady
+    }
+
+    var avgX: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _avgX
+    }
+
+    var avgY: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _avgY
+    }
+
+    var avgZ: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _avgZ
+    }
+
+    var lastAccTime: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastAccTime
+    }
 
     /// 等待应答的指令（由外部写入）
-    var pendingCommand: [UInt8]?
+    var pendingCommand: [UInt8]? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _pendingCommand
+        }
+        set {
+            lock.lock()
+            _pendingCommand = newValue
+            lock.unlock()
+        }
+    }
+
     /// 收到匹配应答时回调
     var onAck: (() -> Void)?
     /// 连接就绪状态变化
@@ -84,7 +134,22 @@ final class Gy25tParser {
     /// 方向确认（同方向连续 20 帧）
     var onDirection: ((SensorDirection) -> Void)?
 
+    /// 刷新最近有效帧时间（初始化完成或系统休眠唤醒后给予宽限期）
+    func touchWatchdog() {
+        lock.lock()
+        _lastAccTime = Date()
+        lock.unlock()
+    }
+
+    /// 看门狗判定离线时同步清除就绪状态，确保后续恢复数据帧时能再次触发 onReadyChanged(true)
+    func markOffline() {
+        lock.lock()
+        _isReady = false
+        lock.unlock()
+    }
+
     func reset() {
+        lock.lock()
         rx.removeAll()
         accX = [Int](repeating: 0, count: Const.accWindow)
         accY = [Int](repeating: 0, count: Const.accWindow)
@@ -92,25 +157,34 @@ final class Gy25tParser {
         accIndex = 0
         accCount = 0
         countMap.removeAll()
-        lastDirection = .unknown
-        avgX = 0; avgY = 0; avgZ = 0
-        lastAccTime = .distantPast
-        if isReady {
-            isReady = false
+        _lastDirection = .unknown
+        _avgX = 0; _avgY = 0; _avgZ = 0
+        _lastAccTime = .distantPast
+        _pendingCommand = nil
+        let wasReady = _isReady
+        _isReady = false
+        lock.unlock()
+
+        if wasReady {
             onReadyChanged?(false)
         }
     }
 
-    /// 喂入原始字节；内部按帧切分处理。
+    /// 喂入原始字节；内部按帧切分处理，所有外部回调均在锁外触发。
     func feed(_ data: Data) {
+        var ackCount = 0
+        var becameReady = false
+        var directions: [SensorDirection] = []
+
+        lock.lock()
         rx.append(contentsOf: data)
         while rx.count >= 5 {
             guard let start = rx.firstIndex(of: 0xA4) else {
                 rx.removeAll()
-                return
+                break
             }
             if start > 0 { rx.removeFirst(start) }
-            guard rx.count >= 4 else { return }
+            guard rx.count >= 4 else { break }
 
             let function = rx[1]
             let total: Int
@@ -123,19 +197,43 @@ final class Gy25tParser {
                 continue
             }
 
-            guard rx.count >= total else { return }
+            guard rx.count >= total else { break }
             let frame = Array(rx[0..<total])
             rx.removeFirst(total)
-            handle(frame: frame)
+            handleLocked(
+                frame: frame,
+                ackCount: &ackCount,
+                becameReady: &becameReady,
+                directions: &directions
+            )
+        }
+        lock.unlock()
+
+        if ackCount > 0 {
+            for _ in 0..<ackCount { onAck?() }
+        }
+        if becameReady {
+            onReadyChanged?(true)
+        }
+        for direction in directions {
+            onDirection?(direction)
         }
     }
 
-    private func handle(frame: [UInt8]) {
+    private func handleLocked(
+        frame: [UInt8],
+        ackCount: inout Int,
+        becameReady: inout Bool,
+        directions: inout [SensorDirection]
+    ) {
         guard frame.count >= 2, frame[0] == 0xA4, checksumOK(frame) else { return }
-        if handleWriteFeedback(frame) { return }
+        if handleWriteFeedbackLocked(frame) {
+            ackCount += 1
+            return
+        }
         // 加速度帧：A4 03 08 06 + X/Y/Z 各 2 字节 + 校验
         if frame.count == 11, frame[1] == 0x03, frame[2] == 0x08, frame[3] == 0x06 {
-            handleAcceleration(frame)
+            handleAccelerationLocked(frame, becameReady: &becameReady, directions: &directions)
         }
     }
 
@@ -146,25 +244,27 @@ final class Gy25tParser {
         return sum == frame[frame.count - 1]
     }
 
-    private func handleWriteFeedback(_ frame: [UInt8]) -> Bool {
-        guard let pending = pendingCommand, pending.count >= 4, frame.count >= 4 else { return false }
+    private func handleWriteFeedbackLocked(_ frame: [UInt8]) -> Bool {
+        guard let pending = _pendingCommand, pending.count >= 4, frame.count >= 4 else { return false }
         if frame[1] == 0x03 || frame[1] == 0x06 {
             if frame[1] == pending[1], frame[2] == pending[2], frame[3] == pending[3] {
-                onAck?()
                 return true
             }
         } else if frame[1] == 0x86 || frame[1] == 0x83 {
-            onAck?()
             return true
         }
         return false
     }
 
-    private func handleAcceleration(_ frame: [UInt8]) {
-        lastAccTime = Date()
-        if !isReady {
-            isReady = true
-            onReadyChanged?(true)
+    private func handleAccelerationLocked(
+        _ frame: [UInt8],
+        becameReady: inout Bool,
+        directions: inout [SensorDirection]
+    ) {
+        _lastAccTime = Date()
+        if !_isReady {
+            _isReady = true
+            becameReady = true
         }
 
         let ix = Int(Int16(bitPattern: UInt16(frame[4]) << 8 | UInt16(frame[5]))) / 100
@@ -184,9 +284,9 @@ final class Gy25tParser {
         }
         let qx = Int((Double(sx) / Double(accCount) / 160.0).rounded())
         let qy = Int((Double(sy) / Double(accCount) / 160.0).rounded())
-        avgX = Int((Double(sx) / Double(accCount)).rounded())
-        avgY = Int((Double(sy) / Double(accCount)).rounded())
-        avgZ = Int((Double(sz) / Double(accCount)).rounded())
+        _avgX = Int((Double(sx) / Double(accCount)).rounded())
+        _avgY = Int((Double(sy) / Double(accCount)).rounded())
+        _avgZ = Int((Double(sz) / Double(accCount)).rounded())
 
         let direction = Self.direction(x: qx, y: qy)
         let count = countMap[direction] ?? 0
@@ -195,9 +295,9 @@ final class Gy25tParser {
             countMap[direction] = 1
         } else {
             if count == Const.confirmFrames {
-                lastDirection = direction
+                _lastDirection = direction
                 if direction != .unknown {
-                    onDirection?(direction)
+                    directions.append(direction)
                 }
             }
             if count < 100 { countMap[direction] = count + 1 }
