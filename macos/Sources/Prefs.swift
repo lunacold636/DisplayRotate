@@ -12,7 +12,6 @@ enum Prefs {
         static let simulation = "simulation"
         static let landscapeDirection = "landscapeDirection"
         static let resetRotation = "resetRotation"
-        static let reverseRotation = "reverseRotation"
     }
 
     /// 上次使用的串口设备路径，例如 /dev/cu.usbserial-1130
@@ -41,15 +40,6 @@ enum Prefs {
     static var simulation: Bool {
         get { store.bool(forKey: Key.simulation) }
         set { store.set(newValue, forKey: Key.simulation) }
-    }
-
-    /// 旋转方向反转：开启后 90° 与 270° 互换（屏幕转动方向与物理转动相反时使用）
-    static var reverseRotation: Bool {
-        get {
-            if store.object(forKey: Key.reverseRotation) == nil { return true }
-            return store.bool(forKey: Key.reverseRotation)
-        }
-        set { store.set(newValue, forKey: Key.reverseRotation) }
     }
 
     /// 一键复位的目标角度（度），默认 0°

@@ -54,10 +54,7 @@ final class RotationEngine {
     // MARK: 生命周期
 
     func start() {
-        rotateMap = RotationMap.build(
-            landscape: SensorDirection(rawValue: Prefs.landscapeDirection) ?? .left,
-            reversed: Prefs.reverseRotation
-        )
+        rotateMap = RotationMap.build(landscape: SensorDirection(rawValue: Prefs.landscapeDirection) ?? .left)
         refreshPorts()
         refreshDisplays()
         resyncApplied()
@@ -262,21 +259,7 @@ final class RotationEngine {
     // MARK: 状态回调
 
     private func handleDirection(_ direction: SensorDirection) {
-        if direction != lastDirection {
-            Log.info("传感器方向：\(direction.label)")
-        }
         lastDirection = direction
-        onChange?()
-    }
-
-    /// 切换旋转方向（90° 与 270° 互换）
-    func setReverseRotation(_ reversed: Bool) {
-        Prefs.reverseRotation = reversed
-        rotateMap = RotationMap.build(
-            landscape: SensorDirection(rawValue: Prefs.landscapeDirection) ?? .left,
-            reversed: reversed
-        )
-        Log.info("旋转方向：\(reversed ? "反向（90°↔270°）" : "标准")")
         onChange?()
     }
 
