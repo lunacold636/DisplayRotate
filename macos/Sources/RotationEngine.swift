@@ -31,7 +31,6 @@ final class RotationEngine {
     private(set) var lastDirection: SensorDirection = .unknown
     private(set) var appliedRotation: DisplayRotation = .r0
     private(set) var targetDisplay: DisplayInfo?
-    private(set) var simulationEnabled = false
 
     var onChange: (() -> Void)?
 
@@ -44,8 +43,6 @@ final class RotationEngine {
     private var pollTimer: Timer?
     private var watchdogTimer: Timer?
     private var reconnectTimer: Timer?
-    private var simulateTimer: Timer?
-    private var simulateIndex = 0
     private var reconnectAttempts = 0
     private var reconnectEnabled = false
     private var manualClose = false
@@ -80,9 +77,7 @@ final class RotationEngine {
             self?.watchdogTick()
         }
 
-        if Prefs.simulation {
-            setSimulation(true)
-        } else if !Prefs.port.isEmpty {
+        if !Prefs.port.isEmpty {
             connect(path: Prefs.port)
         }
     }
@@ -93,7 +88,6 @@ final class RotationEngine {
         closePort()
         pollTimer?.invalidate(); pollTimer = nil
         watchdogTimer?.invalidate(); watchdogTimer = nil
-        simulateTimer?.invalidate(); simulateTimer = nil
     }
 
     // MARK: 端口
@@ -302,15 +296,15 @@ final class RotationEngine {
         }
     }
 
-    /// 一键复位：把目标显示器强制转到配置的基准角度（默认 0°）
+    /// 一键复位：把目标显示器强制转回 0°
     @discardableResult
     func resetRotation() -> Bool {
         guard let display = targetDisplay else { return false }
-        let baseline = DisplayRotation(rawValue: Prefs.resetRotation) ?? .r0
+        let baseline: DisplayRotation = .r0
         guard displayManager.setRotation(of: display.id, to: baseline) else { return false }
         appliedRotation = baseline
         lastRotateAt = Date()
-        Log.info("一键复位：\(display.name) → \(baseline.degrees)°")
+        Log.info("一键复位：\(display.name) → 0°")
         refreshDisplays()
         onChange?()
         return true
@@ -330,38 +324,10 @@ final class RotationEngine {
         }
     }
 
-    // MARK: 模拟
-
-    func setSimulation(_ enabled: Bool) {
-        simulationEnabled = enabled
-        Prefs.simulation = enabled
-        simulateTimer?.invalidate()
-        simulateTimer = nil
-
-        if enabled {
-            disconnect(manual: true)
-            isReady = true
-            let order: [SensorDirection] = [.left, .up, .right, .down]
-            simulateIndex = 0
-            lastDirection = order[0]
-            simulateTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                self.simulateIndex = (self.simulateIndex + 1) % order.count
-                self.handleDirection(order[self.simulateIndex])
-            }
-            Log.info("已开启模拟传感器（每 2 秒切换方向）")
-        } else {
-            isReady = false
-            lastDirection = .unknown
-            Log.info("已关闭模拟传感器")
-        }
-        onChange?()
-    }
-
     // MARK: 自动重连
 
     private func scheduleReconnect() {
-        guard !manualClose, !simulationEnabled else { return }
+        guard !manualClose else { return }
         reconnectEnabled = true
         reconnectAttempts += 1
         let exponent = min(reconnectAttempts - 1, 5)

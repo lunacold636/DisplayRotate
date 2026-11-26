@@ -9,9 +9,7 @@ enum Prefs {
         static let portDescription = "portDescription"
         static let displayUUID = "displayUUID"
         static let autoStart = "autoStart"
-        static let simulation = "simulation"
         static let landscapeDirection = "landscapeDirection"
-        static let resetRotation = "resetRotation"
     }
 
     /// 上次使用的串口设备路径，例如 /dev/cu.usbserial-1130
@@ -35,20 +33,6 @@ enum Prefs {
     static var autoStart: Bool {
         get { store.bool(forKey: Key.autoStart) }
         set { store.set(newValue, forKey: Key.autoStart) }
-    }
-
-    static var simulation: Bool {
-        get { store.bool(forKey: Key.simulation) }
-        set { store.set(newValue, forKey: Key.simulation) }
-    }
-
-    /// 一键复位的目标角度（度），默认 0°
-    static var resetRotation: Int {
-        get {
-            if store.object(forKey: Key.resetRotation) == nil { return 0 }
-            return store.integer(forKey: Key.resetRotation)
-        }
-        set { store.set(newValue, forKey: Key.resetRotation) }
     }
 
     /// 横屏 0° 时传感器朝上的是哪个方向（安装约定，默认 left，与 Windows 版一致）

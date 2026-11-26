@@ -72,8 +72,7 @@ enum SelfTest {
             let resetOK = engine.resetRotation()
             Thread.sleep(forTimeInterval: 1.2)
             let afterReset = manager.currentRotation(of: target.id)
-            let baseline = DisplayRotation(rawValue: Prefs.resetRotation) ?? .r0
-            check("一键复位到 \(baseline.label)", resetOK && afterReset == baseline, "实际 \(afterReset.label)")
+            check("一键复位到 0°", resetOK && afterReset == .r0, "实际 \(afterReset.label)")
         }
 
         print(failures == 0 ? "\n全部通过" : "\n\(failures) 项失败")

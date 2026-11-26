@@ -2,11 +2,12 @@ import AppKit
 import Combine
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let engine = RotationEngine()
     private var model: AppModel!
     private var statusItem: NSStatusItem!
-    private var window: NSWindow?
+    private let popover = NSPopover()
+    private var eventMonitor: Any?
     private var cancellable: AnyCancellable?
     private let arguments: [String]
 
@@ -20,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         model = AppModel(engine: engine)
         setupStatusItem()
+        setupPopover()
         engine.start()
         model.refresh()
 
@@ -28,12 +30,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if !arguments.contains("--autostart") || arguments.contains("--show-settings") {
-            showWindow()
+            DispatchQueue.main.async { [weak self] in
+                self?.showPopover()
+            }
         }
         Log.info("DisplayRotate 已启动，参数：\(arguments.dropFirst().joined(separator: " "))")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopEventMonitor()
         engine.shutdown()
         Log.info("DisplayRotate 已退出")
     }
@@ -55,6 +60,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusItem()
     }
 
+    private func setupPopover() {
+        let hosting = NSHostingController(rootView: SettingsView(model: model))
+        hosting.sizingOptions = .preferredContentSize
+        popover.contentViewController = hosting
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem?.button, let model else { return }
         let active = model.connected && model.ready
@@ -66,9 +80,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let event = NSApp.currentEvent
         let isSecondary = event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
         if isSecondary {
+            if popover.isShown { closePopover() }
             showContextMenu()
         } else {
-            showWindow()
+            togglePopover()
         }
     }
 
@@ -81,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
-        let open = NSMenuItem(title: "打开设置…", action: #selector(showWindowAction), keyEquivalent: ",")
+        let open = NSMenuItem(title: "打开控制面板", action: #selector(showPopoverAction), keyEquivalent: ",")
         open.target = self
         menu.addItem(open)
 
@@ -101,15 +116,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.isEnabled = model.connected || !model.selectedPort.isEmpty
         menu.addItem(toggle)
 
-        let reset = NSMenuItem(title: "一键复位到 \(model.resetBaseline)°", action: #selector(resetRotation), keyEquivalent: "r")
+        let reset = NSMenuItem(title: "一键复位到 0°", action: #selector(resetRotation), keyEquivalent: "r")
         reset.target = self
         reset.isEnabled = model.rotationAvailable && !model.displays.isEmpty
         menu.addItem(reset)
-
-        let simulate = NSMenuItem(title: "模拟传感器", action: #selector(toggleSimulation), keyEquivalent: "")
-        simulate.target = self
-        simulate.state = model.simulation ? .on : .off
-        menu.addItem(simulate)
 
         menu.addItem(.separator())
 
@@ -120,8 +130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func statusTitle() -> NSAttributedString {
-        let color: NSColor = model.simulation ? .systemBlue
-            : (model.connected && model.ready ? .systemGreen : (model.connected ? .systemOrange : .systemRed))
+        let color: NSColor = (model.connected && model.ready)
+            ? .systemGreen
+            : (model.connected ? .systemOrange : .systemRed)
         let text = NSMutableAttributedString(
             string: "● ",
             attributes: [.foregroundColor: color, .font: NSFont.systemFont(ofSize: 12)]
@@ -133,25 +144,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return text
     }
 
-    // MARK: 窗口
+    // MARK: Popover
 
-    @objc private func showWindowAction() {
-        showWindow()
+    @objc private func showPopoverAction() {
+        showPopover()
     }
 
-    private func showWindow() {
-        if window == nil {
-            let hosting = NSHostingController(rootView: SettingsView(model: model))
-            let created = NSWindow(contentViewController: hosting)
-            created.title = "DisplayRotate"
-            created.styleMask = [.titled, .closable, .miniaturizable]
-            created.isReleasedWhenClosed = false
-            created.setFrameAutosaveName("DisplayRotateMainWindow")
-            created.center()
-            window = created
+    private func togglePopover() {
+        if popover.isShown {
+            closePopover()
+        } else {
+            showPopover()
         }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        model.refresh()
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+        startEventMonitor()
+    }
+
+    private func closePopover() {
+        popover.performClose(nil)
+        stopEventMonitor()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopEventMonitor()
+    }
+
+    private func startEventMonitor() {
+        stopEventMonitor()
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            guard let self, self.popover.isShown else { return }
+            self.closePopover()
+        }
+    }
+
+    private func stopEventMonitor() {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
     }
 
     // MARK: 菜单动作
@@ -166,10 +203,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func resetRotation() {
         model.resetRotation()
-    }
-
-    @objc private func toggleSimulation() {
-        model.setSimulation(!model.simulation)
     }
 
     @objc private func quit() {

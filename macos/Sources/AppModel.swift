@@ -13,12 +13,10 @@ final class AppModel: ObservableObject {
     @Published var screenRotation: DisplayRotation = .r0
     @Published var targetDisplayName = "—"
     @Published var rotationAvailable = false
-    @Published var simulation = false
     @Published var autoStart = false
     @Published var selectedPort = ""
     @Published var selectedDisplayUUID = ""
     @Published var message = ""
-    @Published var resetBaseline = 0
 
     let engine: RotationEngine
 
@@ -30,9 +28,9 @@ final class AppModel: ObservableObject {
 
     var statusText: String {
         if engine.isConnected {
-            return engine.isReady ? "已连接" : "已连接（等待传感器数据）"
+            return engine.isReady ? "已连接" : "等待数据…"
         }
-        return simulation ? "模拟模式" : "未连接"
+        return "未连接"
     }
 
     var statusColorName: String {
@@ -47,7 +45,6 @@ final class AppModel: ObservableObject {
         direction = engine.lastDirection
         applied = engine.appliedRotation
         rotationAvailable = engine.displayManager.isRotationAvailable
-        simulation = engine.simulationEnabled
         targetDisplayName = engine.targetDisplay?.displayName ?? "—"
         if let target = engine.targetDisplay {
             selectedDisplayUUID = target.uuid
@@ -60,7 +57,6 @@ final class AppModel: ObservableObject {
             selectedPort = engine.isConnected ? Prefs.port : (ports.first?.path ?? "")
         }
         autoStart = LaunchAtLogin.isEnabled
-        resetBaseline = Prefs.resetRotation
     }
 
     // MARK: 操作
@@ -96,21 +92,15 @@ final class AppModel: ObservableObject {
         refresh()
     }
 
-    func setSimulation(_ enabled: Bool) {
-        engine.setSimulation(enabled)
-        refresh()
-    }
-
     func setAutoStart(_ enabled: Bool) {
         do {
             try LaunchAtLogin.setEnabled(enabled)
-            message = enabled ? "已开启开机自启" : "已关闭开机自启"
+            message = ""
         } catch {
             message = "设置开机自启失败：\(error.localizedDescription)"
             Log.error("设置开机自启失败", error)
         }
         autoStart = LaunchAtLogin.isEnabled
-        resetBaseline = Prefs.resetRotation
     }
 
     func cycleTestRotation() {
@@ -125,11 +115,6 @@ final class AppModel: ObservableObject {
             message = ""
         }
         refresh()
-    }
-
-    func setResetBaseline(_ degrees: Int) {
-        Prefs.resetRotation = degrees
-        resetBaseline = degrees
     }
 
     func openLogFolder() {
