@@ -36,10 +36,14 @@ enum DisplayRotation: Int, CaseIterable {
 
 /// 传感器方向 → 屏幕旋转 的固定映射（与 Windows 版一致：按循环序建立）
 enum RotationMap {
-    /// dirs 顺序固定为 上/右/下/左，对应 0/90/180/270
-    static func build(landscape: SensorDirection) -> [SensorDirection: DisplayRotation] {
+    /// dirs 顺序固定为 上/右/下/左
+    /// - reversed = false：0/90/180/270（顺时针递增）
+    /// - reversed = true ：0/270/180/90（逆时针递增，90° 与 270° 互换）
+    static func build(landscape: SensorDirection, reversed: Bool = false) -> [SensorDirection: DisplayRotation] {
         let dirs: [SensorDirection] = [.up, .right, .down, .left]
-        let rots: [DisplayRotation] = [.r0, .r90, .r180, .r270]
+        let rots: [DisplayRotation] = reversed
+            ? [.r0, .r270, .r180, .r90]
+            : [.r0, .r90, .r180, .r270]
         guard let base = dirs.firstIndex(of: landscape) else { return [:] }
         var map: [SensorDirection: DisplayRotation] = [:]
         for i in 0..<4 {

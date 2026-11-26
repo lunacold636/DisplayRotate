@@ -18,7 +18,7 @@ struct SettingsView: View {
             aboutSection
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 700)
+        .frame(width: 520, height: 745)
     }
 
     // MARK: 状态
@@ -138,6 +138,11 @@ struct SettingsView: View {
                     .disabled(!model.rotationAvailable || model.displays.isEmpty)
             }
 
+            Toggle("旋转方向反转（90° ↔ 270° 互换）", isOn: Binding(
+                get: { model.reverseRotation },
+                set: { model.setReverseRotation($0) }
+            ))
+
             if !model.rotationAvailable {
                 Label("当前系统未提供旋转接口", systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -146,7 +151,9 @@ struct SettingsView: View {
         } header: {
             Text("显示器")
         } footer: {
-            Text("内置屏无法旋转，已从列表剔除。映射：左→0°　上→90°　右→180°　下→270°")
+            Text(model.reverseRotation
+                 ? "内置屏无法旋转。当前映射：左→0°　上→270°　右→180°　下→90°"
+                 : "内置屏无法旋转。当前映射：左→0°　上→90°　右→180°　下→270°")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

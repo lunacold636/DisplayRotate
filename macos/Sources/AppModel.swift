@@ -19,6 +19,7 @@ final class AppModel: ObservableObject {
     @Published var selectedDisplayUUID = ""
     @Published var message = ""
     @Published var resetBaseline = 0
+    @Published var reverseRotation = true
 
     let engine: RotationEngine
 
@@ -61,6 +62,7 @@ final class AppModel: ObservableObject {
         }
         autoStart = LaunchAtLogin.isEnabled
         resetBaseline = Prefs.resetRotation
+        reverseRotation = Prefs.reverseRotation
     }
 
     // MARK: 操作
@@ -111,6 +113,7 @@ final class AppModel: ObservableObject {
         }
         autoStart = LaunchAtLogin.isEnabled
         resetBaseline = Prefs.resetRotation
+        reverseRotation = Prefs.reverseRotation
     }
 
     func cycleTestRotation() {
@@ -124,6 +127,12 @@ final class AppModel: ObservableObject {
         } else {
             message = ""
         }
+        refresh()
+    }
+
+    func setReverseRotation(_ reversed: Bool) {
+        engine.setReverseRotation(reversed)
+        reverseRotation = reversed
         refresh()
     }
 
